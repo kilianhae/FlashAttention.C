@@ -6,8 +6,8 @@ from torch.utils.cpp_extension import load
 # Load the CUDA kernel as a python module
 minimal_flash = load(name='flash', sources=['main.cpp', 'flashattention_light_torch.cu'], extra_cuda_cflags=['-O2'])
 
-batch_size = 1
-n_head = 1
+batch_size = 20
+n_head = 8
 seq_len = 2048
 head_embd = 32
 torch.cuda.empty_cache()
@@ -33,11 +33,11 @@ print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 print('=== profiling minimal flash attention === ')
 
 with torch.autograd.profiler.profile(use_cuda=True) as prof:
-    minimal_flash = minimal_matmul.forward(q, k, v)
+    minimal_flash = minimal_flash.forward(q, k, v)
 
 print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
-print(minimal_matmul.cpu())
+print(minimal_flash.cpu())
 print(manual_result.cpu())
 #print('attn values sanity check:', torch.allclose(minimal_matmul, manual_result, rtol=0, atol=1e-02))
 
