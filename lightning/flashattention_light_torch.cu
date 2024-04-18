@@ -12,9 +12,10 @@
 
 # define B_r 32
 # define B_c 32
-# define o_per_thread_x 1
-# define o_per_thread_y 32/32
+# define o_per_thread_x 32/32
+
 # define d 32
+# define o_per_thread_y 32/32
 
 #define NEG_INFINITY __int_as_float(0xff800000)
 
@@ -25,12 +26,17 @@ void silly_attn(float *out, float* out_l, float *K, float *Q, float* V, float sc
   int tid_y = threadIdx.y;
   int batch_offset = batch_stride * blockIdx.x;
 
-  __shared__ float Q_i[B_r][d]; // all are fully loaded into shared memory
+  /*
+  all are fully loaded into shared memory, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
+  and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
+  */
+  __shared__ float Q_i[B_r][d]; 
   __shared__ float K_j[B_c][d];
   __shared__ float V_j[B_c][d];
   
   // attention result
   __shared__ float S_i[B_r][B_c];
+
 
   float l_i[o_per_thread_x];
   float m_i[o_per_thread_x];
@@ -38,7 +44,9 @@ void silly_attn(float *out, float* out_l, float *K, float *Q, float* V, float sc
   // this will be automatucally be put onto registers (potentially slow if doesnt fit onto regsters and spills to local memory, prob no way around it)
   float O_i[o_per_thread_x][o_per_thread_y];
 
-  for (int i = 0; i < T_r; i++) {
+  for (int i = 0; i < T_r; i++) { // iterate over the chunks of Q
+
+    // o_per_thread_x, o_per_thread_y is a bit like thread coarsening (each thread takes on multiple elements in loading, and potentially storing)
     for (int ii = 0; ii < o_per_thread_x; ii++) {
       for (int dd = 0; dd < o_per_thread_y; dd++) {
         O_i[ii][dd] = 0;
@@ -46,20 +54,27 @@ void silly_attn(float *out, float* out_l, float *K, float *Q, float* V, float sc
       l_i[ii] = 0.f;
       m_i[ii] = NEG_INFINITY;
     }
-    for (int ii = tid_y; ii < B_r; ii += blockDim.y) {
-      for (int dd = tid_x; dd < d; dd += blockDim.x) {
+
+    // load Q_i
+    for (int ii = tid_y; ii < B_r; ii += blockDim.y) { // each thread loads offsetted to enable memory coalescing
+      for (int dd = tid_x; dd < d; dd += blockDim.x) { // each thread loads offsetted to enable memory coalescing
          Q_i[ii][dd] = Q[batch_offset + (ii + i * B_r) * d + dd];
       }
     }
+
+    // T_c is the number of chunks of K, we iterate over them
     for (int j=0; j < T_c; j++) {
         __syncthreads();
-        for (int jj=tid_y; jj < B_c; jj+= blockDim.y) {
-            for (int dd=tid_x; dd < d; dd += blockDim.x) {
+
+        // load K_j and V_j
+        for (int jj=tid_y; jj < B_c; jj+= blockDim.y) { // each thread loads offsetted to enable memory coalescing
+            for (int dd=tid_x; dd < d; dd += blockDim.x) { // each thread loads offsetted to enable memory coalescing
                 K_j[jj][dd] = K[batch_offset + (jj + j * B_c) * d + dd];
                 V_j[jj][dd] = V[batch_offset + (jj + j * B_c) * d + dd];
             }
         }
         __syncthreads();
+
         // S_i = scale * (Q_i @ K_j.T)
         for (int ii = tid_x; ii < B_r; ii += blockDim.x) {
             for (int jj = tid_y; jj < B_c; jj += blockDim.y) {
@@ -72,6 +87,8 @@ void silly_attn(float *out, float* out_l, float *K, float *Q, float* V, float sc
             }
         }
         __syncthreads();
+
+        // do softmax
         for (int ii = 0; ii < o_per_thread_x; ii++) {
             float m = m_i[ii];
             float last_m = m;
@@ -97,6 +114,8 @@ void silly_attn(float *out, float* out_l, float *K, float *Q, float* V, float sc
 
        }
     }
+
+    // renormalize and add up to output
     for (int ii = 0; ii < o_per_thread_x; ii++) {
       for (int dd = 0; dd < o_per_thread_y; dd++) {
         out[batch_offset + (ii * blockDim.x + tid_x + i * B_r) * d + dd * blockDim.y + tid_y] = O_i[ii][dd] / l_i[ii];
