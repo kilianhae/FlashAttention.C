@@ -34,7 +34,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
   */
   __shared__ float Q_i[B_r][d]; 
   __shared__ float K_j[B_r][B_c];
-  __shared__ float V_j[B_r][d];
+  __shared__ float V_j[B_r][B_c];
   
   // attention result
   __shared__ float S_i[B_r][B_c];
@@ -64,13 +64,6 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
     m_i = NEG_INFINITY;
   }
 
-  // // load 
-  // for (int ii = tid_y; ii < B_r; ii += blockDim.y) { // each thread loads offsetted to enable memory coalescing
-  //   for (int dd = tid_x; dd < d; dd += blockDim.x) { // each thread loads offsetted to enable memory coalescing
-  //       Q_i[ii][dd] = Q[batch_offset + (ii + i * B_r) * d + dd];
-  //   }
-  // }
-
   // load Q_i
   for (int t=0; t<num_tiles; t++){
     Q_i[tid_y][t * B_c + tid_x] = Q[batch_offset + (blockIdx.y * B_r + tid_y) * d + t * B_c + tid_x ];
@@ -88,7 +81,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
       K_j[tid_y][tid_x] = K[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * B_c]; // not with with r and c
       
       // TO OPTIMIZE, just loading the V_j for now
-      V_j[tid_y][t * B_c + tid_x] = V[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * B_c]; // not with with r and c
+      V_j[tid_y][tid_x] = V[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * B_c]; // not with with r and c
       __syncthreads();
 
       // tiled matrix mult
@@ -144,7 +137,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
       l += S_id;
       for (int t = 0; t < num_tiles; t++){
        // replaced o_y with 1
-        O_i[t] += S_id * V_j[dd][t * B_c + tid_x];
+        O_i[t] += S_id * V_j[dd][tid_x];
       }
     }
     l_i = l;

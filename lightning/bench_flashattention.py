@@ -4,10 +4,10 @@ from torch.nn import functional as F
 from torch.utils.cpp_extension import load
 
 # Load the CUDA kernel as a python module
-minimal_flash = load(name='flash', sources=['main.cpp', 'flashattention_light_torch.cu'], extra_cuda_cflags=['-O2'])
+minimal_flash = load(name='flash', sources=['main.cpp', 'flashattention_light_rewrite.cu'], extra_cuda_cflags=['-O2'])
 
 batch_size = 1
-n_head = 1
+n_head = 8
 seq_len = 8192
 head_embd = 32
 torch.cuda.empty_cache()
