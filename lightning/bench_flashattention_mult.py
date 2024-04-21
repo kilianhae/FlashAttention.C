@@ -4,12 +4,12 @@ from torch.nn import functional as F
 from torch.utils.cpp_extension import load
 
 # Load the CUDA kernel as a python module
-minimal_flash = load(name='flash', sources=['main.cpp', 'flashattention_light_torch.cu'], extra_cuda_cflags=['-O2'])
+minimal_flash = load(name='flash', sources=['main.cpp', 'mult_light_rewrite.cu'], extra_cuda_cflags=['-O2'])
 
 batch_size = 1
 n_head = 1
-seq_len = 8192
-head_embd = 32
+seq_len = 64
+head_embd = 64
 torch.cuda.empty_cache()
 
 q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
@@ -19,8 +19,9 @@ v = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 # Compare to Pytroch's matmul
 def manual_attention(q, k):
     S = torch.matmul(q, k.transpose(-2, -1))
-    A = F.softmax(S, dim=-1)
-    O = torch.matmul(A, v)
+    O=S
+    # A = F.softmax(S, dim=-1)
+    # O = torch.matmul(A, v)
     return O
 
 print('=== profiling manual attention ===')
