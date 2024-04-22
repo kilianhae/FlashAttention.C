@@ -256,7 +256,7 @@ torch::Tensor forward(torch::Tensor Q_d, torch::Tensor K_d, torch::Tensor V_d) {
   torch::Tensor O = torch::zeros({batch_size, seq_len, d}, torch::kCUDA);
   torch::Tensor O_l = torch::zeros({batch_size, seq_len}, torch::kCUDA);
 
-  run_silly_attn_parallel(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
+  run_silly_attn(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
   return O;
 }
     

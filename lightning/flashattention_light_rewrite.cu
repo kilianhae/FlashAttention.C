@@ -14,7 +14,7 @@
 # define B_c 32
 # define o_per_thread_x 32/32
 
-# define d 32
+# define d 64
 # define o_per_thread_y d/32
 
 #define NEG_INFINITY __int_as_float(0xff800000)
@@ -38,8 +38,6 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
   
   // attention result
   __shared__ float S_i[B_r][B_c];
-  
-  
   
   // assuming B_c = blockdim.x, within a block, number of tiles a thread has to calculate
   const int num_tiles = d/B_c;
@@ -112,7 +110,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
     // sum up new parts: sum \exp(Q_iK^T_{j+1} - m^{j+1})
     // Compute additional A: \exp(Q_iK^T_{j+1} - m^{j+1}) \cdot V_j
 
-    // 1) fin the max per row (extremely bad) with smem bank conflicts -> (add padding row to S in future)
+    // 1) find the max per row (extremely bad) with smem bank conflicts -> (add padding row to S in future)
     float last_m = m_i;
     float m = m_i;
     for (int jj = 0; jj < B_c; jj += 1) {
