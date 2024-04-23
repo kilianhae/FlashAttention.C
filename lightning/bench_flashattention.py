@@ -8,13 +8,13 @@ minimal_flash = load(name='flash', sources=['main.cpp', 'flashattention_light_re
 
 batch_size = 1
 n_head = 1
-seq_len = 32
-head_embd = 32
+seq_len = 6144
+head_embd = 64
 torch.cuda.empty_cache()
 
-q = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
-k = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
-v = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
+q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
+k = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
+v = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 
 # Compare to Pytroch's matmul
 def manual_attention(q, k):
@@ -31,12 +31,12 @@ print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
 print('=== profiling minimal flash attention === ')
 
-with torch.autograd.profiler.profile(use_cuda=True) as prof:
-    minimal_flash = minimal_flash.forward(q, k, v)
+# with torch.autograd.profiler.profile(use_cuda=True) as prof:
+#     minimal_flash = minimal_flash.forward(q, k, v)
 
-print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
+# print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
-print(minimal_flash.cpu())
-print(manual_result.cpu())
-print('attn values sanity check:', torch.allclose(minimal_flash, manual_result, rtol=0, atol=1e-02))
+# print(minimal_flash.cpu())
+# print(manual_result.cpu())
+# print('attn values sanity check:', torch.allclose(minimal_flash, manual_result, rtol=0, atol=1e-02))
 

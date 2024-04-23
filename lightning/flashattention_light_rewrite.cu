@@ -14,7 +14,7 @@
 //# define B_c 32
 # define o_per_thread_x 32/32
 
-# define d 32
+# define d 64
 # define o_per_thread_y d/32
 
 #define NEG_INFINITY __int_as_float(0xff800000)
@@ -180,14 +180,12 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
 
 // tiling 
 
-
-__global__
-void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c)
+__launch_bounds__(1024)
+__global__ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c)
 {
   int tid_x = threadIdx.x;
   int tid_y = threadIdx.y;
   int batch_offset = batch_stride * blockIdx.x;
-  int i = blockIdx.y;
 
   /*
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
@@ -212,13 +210,14 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   // assuming B_c = blockdim.x, within a block, number of tiles a thread has to calculate
   const int num_tiles = d/BK; // how many tiles there are on the outside 64/64 = 1
   
-  float l_i[TN];
-  float m_i[TN];
-  float last_m[TN];
+  float l_i[TN]; // 4 
+  float m_i[TN]; // 4 
+  float last_m[TN]; // 4
+   float O_i[num_tiles * TN * TM]={0.0}; 
   //float l[TN];
   
   // this will be automatucally be put onto registers since very small
-  float O_i[num_tiles * TN * TM]; // per register, cache before loading into global memory write // 1*8*8 = 64
+  // 4, per register, cache before loading into global memory write // 1*8*8 = 64
 
   // o_per_thread_x, o_per_thread_y is a bit like thread coarsening (each thread takes on multiple elements in loading, and potentially storing)
   for (int t = 0; t < num_tiles; t++) {
@@ -234,14 +233,12 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     l_i[ii] = 0.f;
     m_i[ii] = NEG_INFINITY;
   }
+
   const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
   const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
-
   const uint strideK = numThreadsBlocktile / BK; // 64 / 64 = 1
   const uint innerRowK = threadId_flat / BK; // 0-63 / 64, 0000000000000...0
   const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
-
-  // 
   const int nr_loads = B_r * d / numThreadsBlocktile; //64*64 /64 = 64
 
   
@@ -252,13 +249,14 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   }
   
   __syncthreads();
-  float threadResults[TM * TN] = {0.0};
+  //float threadResults[TM * TN] = {0.0};
   float regM[TM] = {0.0};
   float regN[TN] = {0.0};
 
   // T_c = seq_len (due to K^T) / B_c, chunk over the d dimension
   // T_c is the number of chunks of K, we iterate over them
   for (int j = 0; j < T_c; j++) {
+    float threadResults[TM * TN] = {0.0};
     S_i[tid_y][tid_x] = 0.f;
     for (int t=0; t<num_tiles; t++){
       // load K_j and V_j, thread idx, idy loads idy,idx
@@ -266,19 +264,11 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       for (int i=0; i<B_r; i+=strideK){ // WARNING: only corret for BK=B_c i think
         // need to load 64 x 64 
         K_j[innerRowK+i][innerColK] = K[batch_offset + (innerRowK + j * B_r) * d  + i * d + innerColK + t * B_c]; // not with with r and c
+        V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + (innerRowK + j * B_r) * d  + i * d + innerColK + t * B_c]; // not with with r and c
+
       }
-      // if (threadId_flat == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-      //   // print K_j
-      //   for (int i=0; i<B_r; i++){
-      //     for (int j=0; j<BK; j++){
-      //       printf("%f ", K_j[i][j]);
-      //     }
-      //     printf("\n");
-      //   }
-      // }
       
       // TO OPTIMIZE, just loading the V_j for now
-      V_j[tid_y][t * B_c + tid_x] = V[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * B_c]; // not with with r and c
       __syncthreads();
 
       // tiled matrix mult (NEEDS TO BE COARSENED NOW!)
@@ -324,7 +314,14 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     // all with same tid_y collaborate on a reduce scheme to find max and finally the one at position 0 is the max
     
     //let threa 0 block 0 print S
-
+    // if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0){
+    //   for (int i=0; i<B_r; i++){
+    //     for (int jj=0; jj<B_c; jj++){
+    //       printf("%f ", S_i[i][jj]);
+    //     }
+    //     printf("\n");
+    //   }
+    // }
 
 
     // each tread now needs to find amx of the rows its assigned to
@@ -338,6 +335,12 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       }
       __syncthreads();
       m_i[i] = m;
+    }
+
+    if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0){
+      for (int i=0; i<TN; i++){
+        printf("m_i: %f\n", m_i[i]);
+      }
     }
 
     // load urself and load urself + B_c/2
@@ -364,6 +367,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     // }
     // }
     
+    
     __syncthreads();
     // 2) renormalize current O and // 3) renormalize the sum
     for (int t = 0; t < num_tiles; t++){
@@ -371,39 +375,71 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
         for (int jj=0;jj<TM;++jj){
           O_i[t*TN*TM + i*TM + j] *= exp(last_m[i] - m_i[i]);
         }
-      //l[i] = exp(last_m[i] - m_i[i]) * l_i[i];
+      // l[i] = exp(last_m[i] - m_i[i]) * l_i[i];
       }
     }
+
+    if (threadIdx.x==0 && threadIdx.y==0 && blockIdx.x == 0 && blockIdx.y == 0){
+      for (int i=0; i<TN; i++){
+        for (int jj=0; jj<TM; jj++){
+          printf("%f ", O_i[i*TM+jj]);
+        }
+        printf("\n");
+      }
+    }
+
 
     // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1})
     
     __syncthreads();
-    for (int dd = 0; dd < B_c; dd++) {
+    for (int dd = 0; dd < B_c; dd++) { // 32 iterates
+    __syncthreads();
       for (int ii=0;ii<TN;ii++){
-        regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]);
-        l_i[ii] += regM[ii];
+        regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]); // exp(64-64) = 1
+        
+        l_i[ii] += regM[ii]; // +=1 -> 32
         __syncthreads();
       }
       __syncthreads();
-      for (int t = 0; t < num_tiles; t++){
+      for (int t = 0; t < num_tiles; t++){ // 2
        // replaced o_y with 1
-       for (int ii=0;ii<TN;ii++){
-        regN[ii] = V_j[dd][t * B_c + threadCol * TN + ii];
+       for (int ii=0;ii<TN;ii++){ // 4
+        regN[ii] = V_j[dd][t * B_c + threadCol * TN + ii]; // set to 1
+        printf("regN: %f\n", regN[ii]);
         __syncthreads();
         for (int jj=0;jj<TN;jj++){
-        O_i[t*TN*TM+ii*TM+jj] += regM[ii] * regN[jj];
-        }}
+          O_i[t*TN*TM+ii*TM+jj] += regM[ii] * regN[jj]; // every =_i is += 1 32 times
+        }__syncthreads();}
+        __syncthreads();
+      }
+      __syncthreads();
+    }
+
+
+    
+    if (threadIdx.x==0 && threadIdx.y==0 && blockIdx.x == 0 && blockIdx.y == 0){
+      for (int i=0; i<TN; i++){
+        for (int jj=0; jj<TM; jj++){
+          printf("%f ", O_i[i*TM+jj]);
+        }
+        printf("\n");
       }
     }
+
+    
+    //print l_i
+    
     //l_i = l;
     __syncthreads();
   }
+  
+
 
   // normalize the whole thing by the sum and write to output
   for (int t = 0; t < num_tiles; t++){
     for (int ii=0;ii<TN;ii++){
       for (int jj=0;jj<TN;jj++){
-        out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadRow*TN+jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
+                out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN+jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
       }
     }  
   }

@@ -87,6 +87,8 @@ void silly_attn_mult(float *out, float* out_l, float *K, float *Q, float* V, flo
   }
   __syncthreads();
 
+  
+
   // T_c = seq_len (due to K^T) / B_c, chunk over the d dimension
   // T_c is the number of chunks of K, we iterate over them
   for (int j = 0; j < T_c; j++) {
@@ -172,15 +174,15 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
   and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
   */
-  __shared__ float Q_i[B_r][d]; // fully stored 64 x 128
-  __shared__ float K_j[B_r][BK]; // used to be B_r x B_c but now is B_r x B_K (BN x BK) 64 x 64
-  __shared__ float V_j[B_r][d]; // fully stored  64 x 128
+  __shared__ float Q_i[B_r][d]; // fully stored 32 x 64
+  __shared__ float K_j[B_r][BK]; // used to be B_r x B_c but now is B_r x B_K (BN x BK) 32 x 32
+  __shared__ float V_j[B_r][d]; // fully stored  32 x 64
   
   // attention result
-  __shared__ float S_i[B_r][B_c]; //64 x 64 
+  __shared__ float S_i[B_r][B_c]; //32 x 32 
   
-  const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block, 4096 = 64 x 64
-  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // (64 * 64) / (8 * 8) = 64
+  const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block, 4096 = 32 x 32
+  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // (32 * 32) / (4 x 4) = 64
   const int threadId_flat = threadIdx.y * blockDim.x + threadIdx.x;
 
   // each thread process 1 block
@@ -189,7 +191,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   const int threadRow = threadId_flat / (B_c / TN); // 0-63 / 8 => 0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,..., 7,7,7,7,7,7,7,7
 
   // assuming B_c = blockdim.x, within a block, number of tiles a thread has to calculate
-  const int num_tiles = d/BK; // how many tiles there are on the outside 128/64 = 2
+  const int num_tiles = d/BK; // how many tiles there are on the outside 64/32 = 2
   
   float l_i;
   float m_i;
@@ -210,12 +212,12 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
   const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
 
-  const uint strideK = numThreadsBlocktile / BK; // 64 / 64 = 1
-  const uint innerRowK = threadId_flat / BK; // 0-63 / 64, 0000000000000...0
-  const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
+  const uint strideK = numThreadsBlocktile / BK; // 64 / 32 = 2
+  const uint innerRowK = threadId_flat / BK; // 0-32 / 64, 0000000000000...,11111....11
+  const uint innerColK = threadId_flat % BK; // 0-32 % 64, 0123456789101112...31,123456...31
 
   // 
-  const int nr_loads = B_r * d / numThreadsBlocktile; //64*128 /64 = 128
+  const int nr_loads = B_r * d / numThreadsBlocktile; //32*64 / 64 = 32
 
   
   // load all of Q_i in coalesced manner 
@@ -225,30 +227,31 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   }
   
   __syncthreads();
-  float threadResults[TM * TN] = {0.0};
+  
   float regM[TM] = {0.0};
   float regN[TN] = {0.0};
 
   // T_c = seq_len (due to K^T) / B_c, chunk over the d dimension
   // T_c is the number of chunks of K, we iterate over them
   for (int j = 0; j < T_c; j++) {
+    float threadResults[TM * TN] = {0.0};
     S_i[tid_y][tid_x] = 0.f;
     for (int t=0; t<num_tiles; t++){
       // load K_j and V_j, thread idx, idy loads idy,idx
-      // we load a tile
-      for (int i=0; i<B_r; i+=strideK){ // WARNING: only corret for BK=B_c i think
+      // we load a tile 
+      for (int i=0; i<B_r; i+=strideK){ // WARNING: 16 times 
         // need to load 64 x 64 
         K_j[innerRowK+i][innerColK] = K[batch_offset + (innerRowK + j * B_r) * d  + i * d + innerColK + t * BK]; // not with with r and c
       }
-      // if (threadId_flat == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-      //   // print K_j
-      //   for (int i=0; i<B_r; i++){
-      //     for (int j=0; j<BK; j++){
-      //       printf("%f ", K_j[i][j]);
-      //     }
-      //     printf("\n");
-      //   }
-      // }
+      if (threadId_flat == 0 && blockIdx.x == 0 && blockIdx.y == 0){
+        // print K_j
+        for (int i=0; i<B_r; i++){
+          for (int j=0; j<BK; j++){
+            printf("%f ", K_j[i][j]);
+          }
+          printf("\n");
+        }
+      }
       
       // TO OPTIMIZE, just loading the V_j for now
       V_j[tid_y][t * B_c + tid_x] = V[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * BK]; // not with with r and c
