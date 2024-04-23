@@ -10,14 +10,23 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-# define B_r 32
-# define B_c 32
+//# define B_r 32
+//# define B_c 32
 # define o_per_thread_x 32/32
 
-# define d 128
+# define d 32
 # define o_per_thread_y d/32
 
 #define NEG_INFINITY __int_as_float(0xff800000)
+
+
+# define B_r 32 // B_r or BM
+# define B_c 32 // B_c or BN
+# define BK 32 // used to be B_c but now different  due to coarsening
+
+// thread - 2nd level tiling
+# define TM 4 // threadblock size
+# define TN 4 // threadblock size
 
 
 __global__
@@ -104,6 +113,8 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
     // 1) fin the max per row (extremely bad) with smem bank conflicts -> (add padding row to S in future)
     // all with same tid_y collaborate on a reduce scheme to find max and finally the one at position 0 is the max
     
+    
+
     float last_m = m_i;
     float m = m_i;
     for (int jj = 0; jj < B_c; jj += 1) {
@@ -168,13 +179,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
 }
 
 // tiling 
-# define B_r 64 // B_r or BM
-# define B_c 64 // B_c or BN
-# define BK 64 // used to be B_c but now different  due to coarsening
 
-// thread - 2nd level tiling
-# define TM 8 // threadblock size
-# define TN 8 // threadblock size
 
 __global__
 void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c)
@@ -210,20 +215,24 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   float l_i[TN];
   float m_i[TN];
   float last_m[TN];
-  float l[TN];
+  //float l[TN];
   
   // this will be automatucally be put onto registers since very small
   float O_i[num_tiles * TN * TM]; // per register, cache before loading into global memory write // 1*8*8 = 64
 
   // o_per_thread_x, o_per_thread_y is a bit like thread coarsening (each thread takes on multiple elements in loading, and potentially storing)
   for (int t = 0; t < num_tiles; t++) {
-    O_i[t] = 0;
+    for (int i=0; i<TN; i++){
+      for (int j=0; j<TM; j++){
+        O_i[t*TN*TM + i*TM + j] = 0;
+      }
+    }
   }
   
   // row wise statistics
-  for (int t = 0; t < num_tiles; t++) {
-    l_i = 0.f;
-    m_i = NEG_INFINITY;
+  for (int ii = 0; ii < TM; ii++) {
+    l_i[ii] = 0.f;
+    m_i[ii] = NEG_INFINITY;
   }
   const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
   const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
@@ -314,6 +323,10 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     // 1) fin the max per row (extremely bad) with smem bank conflicts -> (add padding row to S in future)
     // all with same tid_y collaborate on a reduce scheme to find max and finally the one at position 0 is the max
     
+    //let threa 0 block 0 print S
+
+
+
     // each tread now needs to find amx of the rows its assigned to
     for (int i=0;i<TN;++i){
       last_m[i] = m_i[i];
@@ -363,20 +376,22 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     }
 
     // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1})
-    float S_id[TN];
-    float V_id[TM];
+    
     __syncthreads();
     for (int dd = 0; dd < B_c; dd++) {
       for (int ii=0;ii<TN;ii++){
-        S_id[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]);
-        l_i[ii] += S_id[ii];
-        V_id[ii] = V_j[dd][t * B_c + threadCol * TN + ii];
+        regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]);
+        l_i[ii] += regM[ii];
+        __syncthreads();
       }
+      __syncthreads();
       for (int t = 0; t < num_tiles; t++){
        // replaced o_y with 1
        for (int ii=0;ii<TN;ii++){
+        regN[ii] = V_j[dd][t * B_c + threadCol * TN + ii];
+        __syncthreads();
         for (int jj=0;jj<TN;jj++){
-        O_i[t*TN*TM+ii*TM+jj] += S_id[ii] * V_id[jj];
+        O_i[t*TN*TM+ii*TM+jj] += regM[ii] * regN[jj];
         }}
       }
     }
@@ -404,10 +419,10 @@ void run_silly_attn_parallel(torch::Tensor O, torch::Tensor O_l, torch::Tensor K
 }
 
 
-void silly_attn_parallel_coarse(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
+void run_silly_attn_parallel_coarse(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
   dim3 blockDim(B_r, B_c);
   dim3 gridDim(batch_size, (int) seq_len/B_r);
-  silly_attn_parallel<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c);
+  silly_attn_parallel_coarse<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c);
   cudaDeviceSynchronize();
 }
 
@@ -422,7 +437,7 @@ torch::Tensor forward(torch::Tensor Q_d, torch::Tensor K_d, torch::Tensor V_d) {
   torch::Tensor O = torch::zeros({batch_size, seq_len, d}, torch::kCUDA);
   torch::Tensor O_l = torch::zeros({batch_size, seq_len}, torch::kCUDA);
 
-  run_silly_attn_parallel(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
+  run_silly_attn_parallel_coarse(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
   return O;
 }
     
