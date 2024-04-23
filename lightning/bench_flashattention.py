@@ -8,8 +8,8 @@ minimal_flash = load(name='flash', sources=['main.cpp', 'flashattention_light_re
 
 batch_size = 1
 n_head = 1
-seq_len = 128
-head_embd = 64
+seq_len = 8192
+head_embd = 128
 torch.cuda.empty_cache()
 
 q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()

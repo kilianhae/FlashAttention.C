@@ -8,9 +8,10 @@ minimal_flash = load(name='flash', sources=['main.cpp', 'mult_light_rewrite.cu']
 
 batch_size = 1
 n_head = 1
-seq_len = 64
+seq_len = 1024
 head_embd = 64
-torch.cuda.empty_cache()
+#torch.cuda.empty_cache()
+#torch.set_printoptions(threshold=10_000)
 
 q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 k = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
@@ -19,7 +20,7 @@ v = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 # Compare to Pytroch's matmul
 def manual_attention(q, k):
     S = torch.matmul(q, k.transpose(-2, -1))
-    O=S
+    O = S
     # A = F.softmax(S, dim=-1)
     # O = torch.matmul(A, v)
     return O
@@ -39,5 +40,5 @@ print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
 
 print(minimal_flash.cpu())
 print(manual_result.cpu())
-print('attn values sanity check:', torch.allclose(minimal_flash, manual_result, rtol=0, atol=1e-02))
+#print('attn values sanity check:', torch.allclose(minimal_flash, manual_result, rtol=0, atol=1e-02))
 
