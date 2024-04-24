@@ -155,13 +155,13 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
   */
   
-  __shared__ float Q_i[B_r][d]; // uncomment only if you want to cache over full d (if CACHE_Q = 1)
+  __shared__ float Q_i[B_r][d]; // uncomment only if you want to cache over full d (if CACHE_Q = 1), also + 1 seems to help SMEM latency here too
   //__shared__ float Q_i[B_r][BK]; // if you want to save SMEM loads and keep the full Q loaded then change this to [B_r][d]
-  __shared__ float K_j[B_c][BK];
+  __shared__ float K_j[B_c][BK+1]; // reduce SMEM bank conflicts by adding 1 column as K will be loaded transposed!
   __shared__ float V_j[B_c][d];
   
   // attention result
-  __shared__ float S_i[B_r][B_c];
+  __shared__ float S_i[B_r][B_c+1]; // reduce SMEM bank conflicts by adding 1 column (in the naive softmax part)
   
   const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block
   const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // number of threads needed
@@ -183,7 +183,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     m_i[ii] = NEG_INFINITY;
   }
 
-
+  //WARNING due to coalsecing I should probably add a second set of variables for using BK+1
   const uint strideK = numThreadsBlocktile / BK; // 64 / 64 = 1
   const uint innerRowK = threadId_flat / BK; // 0-63 / 64, 0000000000000...0
   const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
@@ -317,6 +317,8 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     } 
   }
 }
+
+
 
 
 double getTimeStamp() {
