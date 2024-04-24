@@ -1,3 +1,6 @@
+// this is an example I found here: https://github.com/Lightning-AI/lightning-thunder/blob/main/notebooks/extend_thunder_with_cuda_python.ipynb 
+// It served as inspiration but performs much worse, I also think it is not fully correct (for sequence length of 8192 this takles 1 second vs our kernel which takes around 10 ms)
+// We started out by adding sequence level parallelism which already increased performance to 50 ms
 #include <torch/types.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -256,7 +259,7 @@ torch::Tensor forward(torch::Tensor Q_d, torch::Tensor K_d, torch::Tensor V_d) {
   torch::Tensor O = torch::zeros({batch_size, seq_len, d}, torch::kCUDA);
   torch::Tensor O_l = torch::zeros({batch_size, seq_len}, torch::kCUDA);
 
-  run_silly_attn(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
+  run_silly_attn_parallel(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
   return O;
 }
     

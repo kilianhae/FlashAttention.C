@@ -319,8 +319,6 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
 }
 
 
-
-
 double getTimeStamp() {
     struct timeval tv;
     gettimeofday( &tv, NULL );
