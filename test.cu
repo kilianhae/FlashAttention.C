@@ -23,8 +23,10 @@
 # define BK 32 // used to be B_c but now different  due to coarsening
 
 // thread - 2nd level tiling
-# define TM 4 // threadblock size
-# define TN 4 // threadblock size
+# define TM 2 // threadblock size
+# define TN 2// threadblock size
+
+# define CACHE_Q 1 // if you want to cache Q over full d
 
 
 
@@ -34,7 +36,6 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
   int tid_x = threadIdx.x;
   int tid_y = threadIdx.y;
   int batch_offset = batch_stride * blockIdx.x;
-  int i = blockIdx.y;
 
   /*
   all are fully loaded into shared memory, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
@@ -73,7 +74,6 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
   // load Q_i
   for (int t=0; t<num_tiles; t++){
     Q_i[tid_y][t * B_c + tid_x] = Q[batch_offset + (blockIdx.y * B_r + tid_y) * d + t * B_c + tid_x ];
-    // Q[batch_offset + (ii + i * B_r) * d + dd];
   }
   __syncthreads();
 
@@ -86,33 +86,20 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
       // load K_j and V_j, thread idx, idy loads idy,idx
       // we load a tile
       K_j[tid_y][tid_x] = K[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * B_c]; // not with with r and c
-      
+
       // TO OPTIMIZE, just loading the V_j for now
       V_j[tid_y][t * B_c + tid_x] = V[batch_offset + (tid_y + j * B_c) * d  + tid_x + t * B_c]; // not with with r and c
       __syncthreads();
 
-      // tiled matrix mult
-      
+
+
       for (int dd=0; dd<B_c; dd++){
-        S_ij += Q_i[tid_y][t * B_c + dd] * K_j[tid_x][dd]; // this maybe leads to bank conflicts in the K
+        S_ij += Q_i[tid_y][t*B_c+dd] * K_j[tid_x][dd]; // this maybe leads to bank conflicts in the K
       }
       __syncthreads();
     }
     S_i[tid_y][tid_x] += scaling * S_ij;
     __syncthreads();
-
-    // tested up to here with different seq length and hidden dim and seems to work fine
-    // find max of each row for current j: m^{j} = max(m_{j-1},\max_i S_i)
-    // renormalize current A: A^{j} \cdot \exp(m^{j} - m^{j+1})
-    // renormalize the sum: l^{j} \cdot \exp(m^{j} - m^{j+1})
-    // compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1})
-    // sum up new parts: sum \exp(Q_iK^T_{j+1} - m^{j+1})
-    // Compute additional A: \exp(Q_iK^T_{j+1} - m^{j+1}) \cdot V_j
-
-    // 1) fin the max per row (extremely bad) with smem bank conflicts -> (add padding row to S in future)
-    // all with same tid_y collaborate on a reduce scheme to find max and finally the one at position 0 is the max
-    
-    
 
     float last_m = m_i;
     float m = m_i;
@@ -123,32 +110,8 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
     }
     __syncthreads();
     m_i = m;
-
-    // load urself and load urself + B_c/2
-    // if (i%2==0){
-    //   for (int jj = B_c; jj > 0; jj /= 2) {
-    //   float m_i_jj = S_i[tid_y][tid_x + jj];
-    //   if (tid_x < jj) {
-    //     if (S_i[tid_y][tid_x] < m_i_jj){
-    //       S_i[tid_y][tid_x] = m_i_jj;
-    //     }
-    //   }
-    //   __syncthreads();
-    // }
     
-
-    // m_i = S_i[tid_y][0];
-    // __syncthreads();
-    // if(threadIdx.x == 0 && threadIdx.y==0 && blockIdx.x == 0 && blockIdx.y == 0){
-    //   printf("m_i_s: %f\n", m_i);
-    // }
-
-    // if (m_i > last_m) {
-    //   m = m_i;
-    // }
-    // }
-    
-    __syncthreads();
+    // print all of V
     // 2) renormalize current O
     for (int t = 0; t < num_tiles; t++){
       O_i[t] *= exp(last_m - m);
@@ -179,6 +142,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
 
 
 
+
 __global__
 void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c)
 {
@@ -190,99 +154,85 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
   and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
   */
-  __shared__ float Q_i[B_r][BK]; // fully stored 
-  __shared__ float K_j[B_c][BK]; // used to be B_r x B_c but now is B_r x B_K (BN x BK) 64 x 64
-  __shared__ float V_j[B_c][d]; // fully stored  64 x 64
+  
+  __shared__ float Q_i[B_r][d]; // uncomment only if you want to cache over full d (if CACHE_Q = 1)
+  //__shared__ float Q_i[B_r][BK]; // if you want to save SMEM loads and keep the full Q loaded then change this to [B_r][d]
+  __shared__ float K_j[B_c][BK];
+  __shared__ float V_j[B_c][d];
   
   // attention result
-  __shared__ float S_i[B_r][B_c]; //64 x 64 
+  __shared__ float S_i[B_r][B_c];
   
-  const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block, 4096 = 64 x 64
-  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // (64 * 64) / (8 * 8) = 64
-  const int threadId_flat = threadIdx.y * blockDim.x + threadIdx.x;
+  const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block
+  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // number of threads needed
+  const int threadId_flat = threadIdx.y * blockDim.x + threadIdx.x; // flattened thread id  (used for loading tiles coalesced)
 
-  // each thread process 1 block
-  // TODO: check if this is correct
+  // each thread process 1 block at position:
   const int threadCol = threadId_flat % (B_c / TN); // 0-63 % 8 => 0,1,2,3,4...7,0,1,2,3,4...7,... 0,1,2,3,4...7
   const int threadRow = threadId_flat / (B_c / TN); // 0-63 / 8 => 0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,..., 7,7,7,7,7,7,7,7
 
-  // assuming B_c = blockdim.x, within a block, number of tiles a thread has to calculate
-  const int num_tiles = d/BK; // how many tiles there are on the outside 64/64 = 1
+  const int num_tiles = d/BK; // how many tiles are the computationof the attention is split into
   
-  float l_i[TN]; // 4 
-  float m_i[TN]; // 4 
-  float last_m[TN]; // 4
-  float O_i[num_tiles * TN * TM]={0.0}; 
-  //float l[TN];
+  float l_i[TM]= {0.0};; // storing the intermediate sum of exp per row
+  float m_i[TM]; // storing the intermediate max of the rows
+  float last_m[TM]; // storing the last max of the rows
+  float O_i[num_tiles * TN * TM] = {0.0}; // storing the intermediate results of the Outputs (each thread stores a chunk TM x TN per tile)
   
-  // this will be automatucally be put onto registers since very small
-  // 4, per register, cache before loading into global memory write // 1*8*8 = 64
-
-  // o_per_thread_x, o_per_thread_y is a bit like thread coarsening (each thread takes on multiple elements in loading, and potentially storing)
-  for (int t = 0; t < num_tiles; t++) {
-    for (int i=0; i<TN; i++){
-      for (int j=0; j<TM; j++){
-        O_i[t*TN*TM + i*TM + j] = 0;
-      }
-    }
-  }
-  
-  // row wise statistics
+  // rset to min
   for (int ii = 0; ii < TM; ii++) {
-    l_i[ii] = 0.f;
     m_i[ii] = NEG_INFINITY;
   }
 
-  const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
-  const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
+
   const uint strideK = numThreadsBlocktile / BK; // 64 / 64 = 1
   const uint innerRowK = threadId_flat / BK; // 0-63 / 64, 0000000000000...0
   const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
-  const int nr_loads = B_r * d / numThreadsBlocktile; //64*64 /64 = 64
 
-  
-  // load all of Q_i in coalesced manner 
-  // for (int t=0; t<nr_loads; t++){
-  //   // need to laod block of size B_r x d (64 x 64) with numThreadsBlocktile threads
-  //   Q_i[innerRowQ][innerColQ + t * numThreadsBlocktile] = Q[batch_offset + (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile];
-  // }
-  
+
+  // load Q_i, UNCOMMENT only if your Q is caching over full d
+  if (CACHE_Q){
+    const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
+    const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
+    const uint nr_loads = B_r * d / numThreadsBlocktile;
+    for (int t=0; t<nr_loads; t++){
+      // need to laod block of size B_r x d (64 x 64) with numThreadsBlocktile threads
+      Q_i[innerRowQ][innerColQ + t * numThreadsBlocktile] = Q[batch_offset + (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile];
+    }
+  }
   __syncthreads();
-  //float threadResults[TM * TN] = {0.0};
+
+  // scratchboard register for registertiling (coarsening of the matrix mults)
   float regM[TM] = {0.0};
   float regN[TN] = {0.0};
 
-  // T_c = seq_len (due to K^T) / B_c, chunk over the d dimension
-  // T_c is the number of chunks of K, we iterate over them
-  for (int j = 0; j < T_c; j++) {
-    float threadResults[TM * TN] = {0.0};
+  for (int j = 0; j < T_c; j++) { // iterate of ver the chunks of K and V
+    float threadResults[TM * TN] = {0.0}; // storing the intermediate outputs
     S_i[tid_y][tid_x] = 0.f;
+    
     for (int t=0; t<num_tiles; t++){
       // load K_j and V_j, thread idx, idy loads idy,idx
       // we load a tile
-      for (int i=0; i<B_r; i+=strideK){ // WARNING: only corret for BK=B_c i think
-        // need to load 64 x 64 
-        Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c]; // not with with r and c
-
-        K_j[innerRowK+i][innerColK] = K[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c]; // not with with r and c
-        V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c]; // not with with r and c
-
+      for (int i=0; i<B_r; i+=strideK){
+        // load Q, K and V in tiles (for now we are loading the full V)
+        if (not CACHE_Q){Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + blockIdx.y * B_r) * d  + i * d + innerColK + t * B_c];
+        } // if you cache Q over whole d then remove this line
+        K_j[innerRowK+i][innerColK] = K[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c];
+        V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c];
       }
-      
-      // TO OPTIMIZE, just loading the V_j for now
       __syncthreads();
-
-      // tiled matrix mult (NEEDS TO BE COARSENED NOW!)
-      //float S_ij = 0.f;
-      //S_ij += Q_i[tid_y][t * B_c + dd] * K_j[tid_x][dd]; // this maybe leads to bank conflicts in the K
-
-      for (int dd=0; dd<BK; dd++){ // 0 to 64
+      
+      for (int dd=0; dd<BK; dd++){ // load elements of Q_i and K_j^T into registers
         for (uint i = 0; i < TM; ++i) {
-          regM[i] = Q_i[(threadRow * TM + i)][dd];
+          if (CACHE_Q){
+            regM[i] = Q_i[(threadRow * TM + i)][dd+t*BK]; // uncomment if you cache Q over full d
+          } else {
+            regM[i] = Q_i[(threadRow * TM + i)][dd];
+          }
         }
         for (uint i = 0; i < TN; ++i) {
           regN[i] = K_j[threadCol * TN + i][dd];
         }
+        __syncthreads();
         for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
           for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
             threadResults[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
@@ -292,6 +242,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       __syncthreads();
     }
 
+    //finally store the results in S_i
     for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
       for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
         S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] =
@@ -299,10 +250,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       }
     }
     __syncthreads();
-
-    // should be correct up to here apart from loading V!
-
-
+    
     // tested up to here with different seq length and hidden dim and seems to work fine
     // find max of each row for current j: m^{j} = max(m_{j-1},\max_i S_i)
     // renormalize current A: A^{j} \cdot \exp(m^{j} - m^{j+1})
@@ -311,138 +259,65 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     // sum up new parts: sum \exp(Q_iK^T_{j+1} - m^{j+1})
     // Compute additional A: \exp(Q_iK^T_{j+1} - m^{j+1}) \cdot V_j
 
-    // 1) fin the max per row (extremely bad) with smem bank conflicts -> (add padding row to S in future)
-    // all with same tid_y collaborate on a reduce scheme to find max and finally the one at position 0 is the max
-    
-    //let threa 0 block 0 print S
-    // if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-    //   for (int i=0; i<B_r; i++){
-    //     for (int jj=0; jj<B_c; jj++){
-    //       printf("%f ", S_i[i][jj]);
-    //     }
-    //     printf("\n");
-    //   }
-    // }
-
-
-    // each tread now needs to find amx of the rows its assigned to
-    for (int i=0;i<TN;++i){
+    // each tread now needs to find max of the rows its assigned to (WARNING: implemented very naively)
+    for (int i=0;i<TM;++i){
       last_m[i] = m_i[i];
       float m = m_i[i];
-      for (int jj = 0; jj < B_r; jj += 1) {
-        if (m < S_i[threadRow*TN+i][jj]) {
-          m = S_i[threadRow*TN+i][jj];
+      for (int jj = 0; jj < B_c; jj += 1) {
+        if (m < S_i[threadRow*TM+i][jj]) {
+          m = S_i[threadRow*TM+i][jj];
         }
+        __syncthreads();
       }
-      __syncthreads();
       m_i[i] = m;
     }
-
-    // if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0){
-    //   for (int i=0; i<TN; i++){
-    //     printf("m_i: %f\n", m_i[i]);
-    //   }
-    // }
-
-    // load urself and load urself + B_c/2
-    // if (i%2==0){
-    //   for (int jj = B_c; jj > 0; jj /= 2) {
-    //   float m_i_jj = S_i[tid_y][tid_x + jj];
-    //   if (tid_x < jj) {
-    //     if (S_i[tid_y][tid_x] < m_i_jj){
-    //       S_i[tid_y][tid_x] = m_i_jj;
-    //     }
-    //   }
-    //   __syncthreads();
-    // }
-    
-
-    // m_i = S_i[tid_y][0];
-    // __syncthreads();
-    // if(threadIdx.x == 0 && threadIdx.y==0 && blockIdx.x == 0 && blockIdx.y == 0){
-    //   printf("m_i_s: %f\n", m_i);
-    // }
-
-    // if (m_i > last_m) {
-    //   m = m_i;
-    // }
-    // }
-    
-    
     __syncthreads();
-    // 2) renormalize current O and // 3) renormalize the sum
+
+    // 2) renormalize current O
+    if (j > 0) {
     for (int t = 0; t < num_tiles; t++){
-      for (int i=0;i<TN;++i){
-        for (int jj=0;jj<TM;++jj){
-          O_i[t*TN*TM + i*TM + j] *= exp(last_m[i] - m_i[i]);
+      for (int i=0;i<TM;++i){
+        for (int jj=0;jj<TN;++jj){
+          O_i[t*TN*TM + i*TN + jj] *= exp(last_m[i] - m_i[i]);
         }
-      // l[i] = exp(last_m[i] - m_i[i]) * l_i[i];
       }
+    }}
+
+    // 3) renormalize the sum l_i
+    for (int i=0;i<TM;++i){
+      l_i[i] *= exp(last_m[i] - m_i[i]);
     }
 
-    // if (threadIdx.x==0 && threadIdx.y==0 && blockIdx.x == 0 && blockIdx.y == 0){
-    //   for (int i=0; i<TN; i++){
-    //     for (int jj=0; jj<TM; jj++){
-    //       printf("%f ", O_i[i*TM+jj]);
-    //     }
-    //     printf("\n");
-    //   }
-    // }
-
-
-    // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1})
-    
-    __syncthreads();
-    for (int dd = 0; dd < B_c; dd++) { // 32 iterates
-      for (int ii=0;ii<TN;ii++){
-        regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]); // exp(64-64) = 1
-        l_i[ii] += regM[ii]; // +=1 -> 32
+    // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TO OPTIMIZE!!
+    for (int dd = 0; dd < B_c; dd++) {
+      for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
+        regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]);
+        l_i[ii] += regM[ii];
+        __syncthreads();
       }
-      __syncthreads();
-      for (int t = 0; t < num_tiles; t++){ // 2
-       // replaced o_y with 1
-       for (int ii=0;ii<TN;ii++){ // 4
-        regN[ii] = V_j[dd][t * B_c + threadCol * TN + ii]; // set to 1
-        //printf("regN: %f\n", regN[ii]);
-        
-        for (int jj=0;jj<TN;jj++){
-          O_i[t*TN*TM+ii*TM+jj] += regM[ii] * regN[jj]; // every =_i is += 1 32 times
-        }}
-        
+      for (int t = 0; t < num_tiles; t++){
+        __syncthreads();
+        for (int ii=0;ii<TN;ii++){
+          for (int jj=0;jj<TM;jj++){ // calculate output elements
+            regN[jj] = V_j[dd][t * B_c + threadCol * TN + jj];
+            O_i[t*TN*TM + ii*TM + jj] += regM[ii] * regN[jj];
+          }
+        }
       }
-      __syncthreads();
     }
-
-
-    
-    // if (threadIdx.x==0 && threadIdx.y==0 && blockIdx.x == 0 && blockIdx.y == 0){
-    //   for (int i=0; i<TN; i++){
-    //     for (int jj=0; jj<TM; jj++){
-    //       printf("%f ", O_i[i*TM+jj]);
-    //     }
-    //     printf("\n");
-    //   }
-    // }
-
-    
-    //print l_i
-    
-    //l_i = l;
     __syncthreads();
   }
-  
 
-
-  // normalize the whole thing by the sum and write to output
+  // normalize the whole thing by the output sum and write to out
   for (int t = 0; t < num_tiles; t++){
-    for (int ii=0;ii<TN;ii++){
+    for (int ii=0;ii<TM;ii++){
       for (int jj=0;jj<TN;jj++){
-                out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN+jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
+                out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN + jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
       }
-    }  
+    } 
   }
-  
 }
+
 
 double getTimeStamp() {
     struct timeval tv;
@@ -452,9 +327,9 @@ double getTimeStamp() {
 
 
 int main() {
-  int seq_len = 6144;
+  int seq_len = 16384;
   int batch_size = 1;
-  dim3 blockDim(B_r/TM, B_c/TN);
+  dim3 blockDim(B_r/TM, B_c/TM);
   dim3 gridDim(batch_size, seq_len/B_r);
   float *K_d, *Q_d, *V_d, *O_l, *O;
   
@@ -466,13 +341,13 @@ int main() {
   // set K_d to 1
   float *K_h = (float*) malloc(batch_size * seq_len * d * sizeof(float));
   for (int i = 0; i < batch_size * seq_len * d; i++) {
-    K_h[i] = 1.0;
+    K_h[i] = i;
   }
   cudaMemcpy(K_d, K_h, batch_size * seq_len * d * sizeof(float), cudaMemcpyHostToDevice);
   // set Q_d to 1
   float *Q_h = (float*) malloc(batch_size * seq_len * d * sizeof(float));
   for (int i = 0; i < batch_size * seq_len * d; i++) {
-    Q_h[i] = 1.0;
+    Q_h[i] = i;
   }
   cudaMemcpy(Q_d, Q_h, batch_size * seq_len * d * sizeof(float), cudaMemcpyHostToDevice);
   // set V_d to 1
@@ -485,13 +360,19 @@ int main() {
 
   double start, end;
   start = getTimeStamp();
+  cudaDeviceSynchronize();
+
   silly_attn_parallel_coarse<<<gridDim, blockDim>>>(O, O_l, K_d, Q_d, V_d, (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c);
   cudaDeviceSynchronize();
   end = getTimeStamp();
   printf("Time: %f\n", end - start);
   cudaMemcpy(O_h, O, batch_size * seq_len * d * sizeof(float), cudaMemcpyDeviceToHost);
-  for (int i = 0; i < batch_size * seq_len * d; i++) {
-    //printf("%f\n", O_h[i]);
+  cudaDeviceSynchronize();
+  for (int i = 0; i < batch_size * 10; i++) {
+    for (int j = 0; j < d; j++) {
+      printf("%f ", O_h[i*d + j]);
+    }
+    printf("\n");
   }
   return 0;
 }
