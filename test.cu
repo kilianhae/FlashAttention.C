@@ -232,6 +232,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
         for (uint i = 0; i < TN; ++i) {
           regN[i] = K_j[threadCol * TN + i][dd];
         }
+        __syncthreads();
         for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
           for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
             threadResults[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
@@ -266,9 +267,11 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
         if (m < S_i[threadRow*TM+i][jj]) {
           m = S_i[threadRow*TM+i][jj];
         }
+        __syncthreads();
       }
       m_i[i] = m;
     }
+    __syncthreads();
 
     // 2) renormalize current O
     if (j > 0) {
@@ -290,8 +293,10 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
         regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]);
         l_i[ii] += regM[ii];
+        __syncthreads();
       }
       for (int t = 0; t < num_tiles; t++){
+        __syncthreads();
         for (int ii=0;ii<TN;ii++){
           for (int jj=0;jj<TM;jj++){ // calculate output elements
             regN[jj] = V_j[dd][t * B_c + threadCol * TN + jj];
@@ -312,6 +317,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     } 
   }
 }
+
 
 
 double getTimeStamp() {

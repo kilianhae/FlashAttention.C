@@ -7,7 +7,7 @@ from torch.utils.cpp_extension import load
 minimal_flash = load(name='flash', sources=['src/main.cpp', 'src/flashattention.cu'], extra_cuda_cflags=[''])
 
 batch_size = 1
-n_head = 1
+n_head = 16
 seq_len = 31
 head_embd = 32
 torch.cuda.empty_cache()
