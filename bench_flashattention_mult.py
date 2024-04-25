@@ -8,7 +8,7 @@ minimal_flash = load(name='flash', sources=['src/main.cpp', 'src/mult_light_rewr
 
 batch_size = 1
 n_head = 1
-seq_len = 32
+seq_len = 33
 head_embd = 32
 #torch.cuda.empty_cache()
 #torch.set_printoptions(threshold=10_000)
