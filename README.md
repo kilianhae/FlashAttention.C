@@ -1,5 +1,5 @@
 ## FlashAttention.C
-A minimal FLashattention implementation in pure Cuda C. It consistently performs as fast as pytorch or faster for settings where the sequence length is limiting.
+A minimal Flashattention implementation in pure Cuda C. It consistently performs as fast as Pytorch or faster for settings where the sequence length is limiting.
 
 Inspired by recent efforts like: [flashattention minimal](https://github.com/tspeterkim/flash-attention-minimal.git), the goal of this project is to provide a readable implementation in pure Cuda, whilst also being fast and scalable.
 
