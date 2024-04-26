@@ -4,16 +4,16 @@ from torch.nn import functional as F
 from torch.utils.cpp_extension import load
 
 # Load the CUDA kernel as a python module
-minimal_flash = load(name='flash', sources=['src/main.cpp', 'src/llmtorch.cu'], extra_cuda_cflags=[''])
+minimal_flash = load(name='flash', sources=['src/main.cpp', 'src/flashattention.cu'], extra_cuda_cflags=['-O3'])
 
-batch_size = 1
-n_head = 12
-seq_len = 1024
+batch_size = 2
+n_head = 8
+seq_len = 8192
 head_embd = 64
 torch.cuda.empty_cache()
 
-q = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
-k = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
+q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
+k = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 v = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
        
 

@@ -10,16 +10,9 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-//# define B_r 32
-//# define B_c 32
-# define o_per_thread_x 32/32
-
-# define d 64
-# define o_per_thread_y d/32
-
 #define NEG_INFINITY __int_as_float(0xff800000)
 
-
+# define d 64
 # define B_r 32 // How many rows of Q_i are processed by one threadblock
 # define B_c 32 // How many rows of K_i and V_i are processed by one threadblock
 # define BK 32 // for now = B_c
@@ -154,8 +147,8 @@ void flash_tiled_coarse(float *out, float* out_l, float *K, float *Q, float* V, 
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
   and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
   */
-  
-  __shared__ float Q_i[B_r][d]; // uncomment only if you want to cache over full d (if CACHE_Q = 1), also + 1 seems to help SMEM latency here too
+  //__shared__ float Q_i[B_r][B_c]; // uncomment only if you dont want to cache over full d (if CACHE_Q = 1)
+  __shared__ float Q_i[B_r][d];
   //__shared__ float Q_i[B_r][BK]; // if you want to save SMEM loads and keep the full Q loaded then change this to [B_r][d]
   __shared__ float K_j[B_c][BK+1]; // reduce SMEM bank conflicts by adding 1 column as K will be loaded transposed!
   __shared__ float V_j[B_c][d];
@@ -226,8 +219,8 @@ void flash_tiled_coarse(float *out, float* out_l, float *K, float *Q, float* V, 
       // we load a tile
       for (int i=0; i<B_r; i+=strideK){
         // load Q, K and V in tiles (for now we are loading the full V)
-        // if (not CACHE_Q){Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + blockIdx.y * B_r) * d  + i * d + innerColK + t * B_c];
-        // } // if you cache Q over whole d then remove this line
+        if (not CACHE_Q){Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + blockIdx.y * B_r) * d  + i * d + innerColK + t * B_c];
+        } // if you cache Q over whole d then remove this line
         id = (innerRowK + j * B_c) * d + i * d + innerColK + t * B_c;
         if (id < d*seq_len){
           K_j[innerRowK+i][innerColK] = K[batch_offset + id];
@@ -307,9 +300,6 @@ void flash_tiled_coarse(float *out, float* out_l, float *K, float *Q, float* V, 
     }
 
     // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TO OPTIMIZE!!
-    int idrow = threadIdx.y*B_r+threadRow*TM;
-    int idcol = j*B_c+threadCol*TN;
-
     for (int dd = 0; dd < bound; dd++) {
       for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
           regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
@@ -325,7 +315,6 @@ void flash_tiled_coarse(float *out, float* out_l, float *K, float *Q, float* V, 
       }
     __syncthreads();
     }
-
   }
 
   // normalize the whole thing by the output sum and write to out
@@ -364,6 +353,6 @@ torch::Tensor forward(torch::Tensor Q_d, torch::Tensor K_d, torch::Tensor V_d) {
   torch::Tensor O = torch::zeros({batch_size, seq_len, d}, torch::kCUDA);
   torch::Tensor O_l = torch::zeros({batch_size, seq_len}, torch::kCUDA);
 
-  run_flash_parallel_coarse(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
+  run_flash_tiled_coarse(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
   return O;
 }

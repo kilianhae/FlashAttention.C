@@ -19,8 +19,8 @@
 # define BK 32 // used to be B_c but now different  due to coarsening
 
 // thread - 2nd level tiling
-# define TM 2 // threadblock size
-# define TN 2// threadblock size
+# define TM 4 // threadblock size
+# define TN 4// threadblock size
 
 # define CACHE_Q 1 // if you want to cache Q over full d (by default set it to True)
 
@@ -340,7 +340,7 @@ void run_flash_tiled_coarse(float* O, float* K_d, float* Q_d, float*  V_d, int b
 
 int main() {
   int seq_len = 8192;
-  int batch_size = 1;
+  int batch_size = 8;
   float *K_d, *Q_d, *V_d, *O;
   cudaMalloc((void**)&O, seq_len * d * sizeof(float));
   cudaMalloc((void**)&K_d, batch_size * seq_len * d * sizeof(float));

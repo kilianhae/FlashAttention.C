@@ -17,7 +17,7 @@
 # define B_c 32
 # define o_per_thread_x 32/32
 
-# define d 32
+# define d 64
 # define o_per_thread_y 32/32
 
 #define NEG_INFINITY __int_as_float(0xff800000)
