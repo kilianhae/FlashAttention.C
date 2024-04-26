@@ -29,7 +29,7 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include <stdlib.h>
 #include <assert.h>
 #include <float.h>
-#include <cublas_v2.h>
+
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -38,7 +38,6 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 // ----------------------------------------------------------------------------
 // CUDA setup
 
-static cublasHandle_t cublas_handle;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
@@ -371,9 +370,88 @@ __global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
 }
 
 
-__global__
-void FlashAttention2(float *out, float *K, float *Q, float* V, float scaling, int T_r, int T_c, int seq_len)
+void attention_forward2(float* out,
+                       const float* inp,
+                       int B, int T, int C, int NH,
+                       const int block_size) {
+    // TODO there should be no mallocs inside any of these functions!
+    // not fixing this because we don't intend to use attention_forward2,
+    // it seems to be way too slow as is
+
+    // these are hardcoded to 32 for now
+    const int Bc = 32;
+    const int Br = 32;
+    // renaming these to be consistent with the kernel
+    // const int B = B;
+    const int nh = NH;
+    const int N = T;
+    const int d = C / NH;
+    // more
+    const int Tc = ceil((float) N / Bc);
+    const int Tr = ceil((float) N / Br);
+    const float softmax_scale = 1.0 / sqrt(d);
+    // create some temporary memory
+    float* l;
+    float* m;
+    cudaCheck(cudaMalloc(&l, B * nh * N * sizeof(float)));
+    cudaCheck(cudaMalloc(&m, B * nh * N * sizeof(float)));
+    cudaCheck(cudaMemset(l, 0, B * nh * N * sizeof(float)));
+    cudaCheck(cudaMemset(m, -10000.0f, B * nh * N * sizeof(float)));
+
+    // calculate SRAM size needed per block, ensure we have enough shared memory
+    int col_tile_size = Bc * d;  // size of Kj, Vj
+    int row_tile_size = Br * d;  // size of Qi
+    const int sram_size =
+        (2 * col_tile_size * sizeof(float))  // SRAM size for Kj, Vj
+        + (row_tile_size * sizeof(float))  // SRAM size for Qi
+        + (Bc * Br * sizeof(float));  // SRAM size for S
+    int max_sram_size;
+    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    if (sram_size > max_sram_size) {
+        printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
+        printf("SRAM size exceeds maximum shared memory per block\n");
+        printf("Try decreasing col_tile_size or row_tile_size further\n");
+        exit(1);
+    }
+
+    // grid and block dims
+    dim3 grid_dim(B, nh);  // batch_size x num_heads
+    dim3 block_dim(Br);  // Br threads per block
+
+    // okay so now, this kernel wants Q,K,V to all be of shape (B, nh, N, d)
+    // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, nh, d)
+    // so we have to permute the tensor using a kernel with block_size
+    float *q, *k, *v;
+    cudaCheck(cudaMalloc(&q, B * T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&k, B * T * C * sizeof(float)));
+    cudaCheck(cudaMalloc(&v, B * T * C * sizeof(float)));
+    int total_threads = B * N * nh * d;
+    int num_blocks = ceil_div(total_threads, block_size);
+    permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, N, nh, d);
+
+    // now actually call the flash attention kernel
+    attention_forward_kernel2<<<grid_dim, block_dim, sram_size>>>(
+        q, k, v,
+        N, d, Tc, Tr, Bc, Br, softmax_scale,
+        l, m, out
+    );
+
+    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+    unpermute_kernel<<<num_blocks, block_size>>>(out, q, B, N, nh, d);
+    cudaCheck(cudaMemcpy(out, q, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+
+    // free memory
+    cudaCheck(cudaFree(l));
+    cudaCheck(cudaFree(m));
+    cudaCheck(cudaFree(q));
+    cudaCheck(cudaFree(k));
+    cudaCheck(cudaFree(v));
+}
+
+__global__ void flashattention(float *out, float *K, float *Q, float* V, float scaling, int T_r, int T_c, int seq_len)
 {   
+    printf("within kenrel");
+
     // define constants
     const int d=64;
     const int B_c = 32;
@@ -381,8 +459,8 @@ void FlashAttention2(float *out, float *K, float *Q, float* V, float scaling, in
     const int BK = B_c;
 
     const int batch_offset = d * seq_len * blockIdx.x;
-    const int TN = 4;
-    const int TM = 4;
+    const int TN = 1;
+    const int TM = 1;
     const int num_tiles = 64/32; // d/BK;
   /*
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
@@ -651,14 +729,17 @@ void attention_forward6(float* out,
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, N, nh, d);
 
     // now actually call the flash attention kernel
-    FlashAttention2<<<blockDim, gridDim>>>(
-        out, k, q, v, softmax_scale,
-        (N+B_r-1)/B_r, (N+B_c-1)/B_c, N
-    );
+    printf("prekernel \n");
+    flashattention<<<blockDim, gridDim>>>(out, k, q, v, softmax_scale, (N+B_r-1)/B_r, (N+B_c-1)/B_c, N);
+    cudaDeviceSynchronize();
 
     // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
-    cudaCheck(cudaMemcpy(out, q, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+    num_blocks = ceil_div(B * T * C, block_size);
 
+    //unpermute_kernel<<<num_blocks, block_size>>>(out, q, B, N, nh, d);
+    cudaDeviceSynchronize();
+    //cudaCheck(cudaMemcpy(out, q, B * T * C * sizeof(float), cudaMemcpyDeviceToDevice));
+    cudaDeviceSynchronize();
     // free memory
     cudaCheck(cudaFree(q));
     cudaCheck(cudaFree(k));
@@ -675,6 +756,7 @@ void attention_forward(int kernel_num,
                        const int block_size) {
     switch (kernel_num) {
         case 1:
+            printf("Running kernel 1\n");
             attention_forward6(out, inp, B, T, C, NH, block_size);
             break;
         default:
@@ -692,9 +774,6 @@ int main(int argc, char **argv) {
     int C = 768;
     int NH = 12;
 
-    int deviceIdx = 0;
-    cudaCheck(cudaSetDevice(deviceIdx));
-    cublasCreate(&cublas_handle);
 
     // create host memory of random numbers
     float* out = (float*)malloc(B * T * C * sizeof(float));
@@ -771,7 +850,6 @@ int main(int argc, char **argv) {
     cudaCheck(cudaFree(d_preatt));
     cudaCheck(cudaFree(d_att));
     cudaCheck(cudaFree(d_inp));
-    cublasDestroy(cublas_handle);
 
     return 0;
 }

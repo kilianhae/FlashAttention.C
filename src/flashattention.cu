@@ -31,7 +31,7 @@
 # define CACHE_Q 1
 
 __global__
-void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c)
+void flash_tiled(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c)
 {
   int tid_x = threadIdx.x;
   int tid_y = threadIdx.y;
@@ -144,7 +144,7 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
 
 
 __global__
-void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c, int seq_len)
+void flash_tiled_coarse(float *out, float* out_l, float *K, float *Q, float* V, float scaling, int batch_stride, int T_r, int T_c, int seq_len)
 {
   int tid_x = threadIdx.x;
   int tid_y = threadIdx.y;
@@ -194,7 +194,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
 
   int id;
   // load Q_i, UNCOMMENT only if your Q is caching over full d
-  if (CACHE_Q){
+  if (CACHE_Q){ // by default set to true
     const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
     const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
     const uint nr_loads = B_r * d / numThreadsBlocktile;
@@ -261,7 +261,6 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       __syncthreads();
     }
     
-
     // store the results in S_i
     for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
       for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
@@ -269,15 +268,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       }
     }
     __syncthreads();
-    
-    // tested up to here with different seq length and hidden dim and seems to work fine
-    // find max of each row for current j: m^{j} = max(m_{j-1},\max_i S_i)
-    // renormalize current A: A^{j} \cdot \exp(m^{j} - m^{j+1})
-    // renormalize the sum: l^{j} \cdot \exp(m^{j} - m^{j+1})
-    // compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1})
-    // sum up new parts: sum \exp(Q_iK^T_{j+1} - m^{j+1})
-    // Compute additional A: \exp(Q_iK^T_{j+1} - m^{j+1}) \cdot V_j
-
+  
     // each tread now needs to find max of the rows its assigned to (WARNING: implemented very naively)
     int bound;
     if (j<T_c-1){
@@ -321,8 +312,6 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
 
     for (int dd = 0; dd < bound; dd++) {
       for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
-        //check wether thus is in range  or not (if not we set it to 0)
-        //if (idrow+ii < seq_len && idcol+dd < seq_len){
           regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
           l_i[ii] += regM[ii];
       }
@@ -352,19 +341,17 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
 }
 
 
-
-void run_silly_attn_parallel(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
+void run_flash_tiled(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
   dim3 blockDim(B_r, B_c);
   dim3 gridDim(batch_size,  (seq_len+B_r-1)/B_r);
-  
-  silly_attn_parallel<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c);
+  flash_tiled<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c);
   cudaDeviceSynchronize();
 }
 
-void run_silly_attn_parallel_coarse(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
+void run_flash_tiled_coarse(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
   dim3 blockDim(B_r/TN, B_c/TM);
   dim3 gridDim(batch_size, (seq_len+B_r-1)/B_r);
-  silly_attn_parallel_coarse<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) (seq_len+B_r-1)/B_r, (int) (seq_len+B_c-1)/B_c, seq_len);
+  flash_tiled_coarse<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) (seq_len+B_r-1)/B_r, (int) (seq_len+B_c-1)/B_c, seq_len);
   cudaDeviceSynchronize();
 }
 
@@ -377,6 +364,6 @@ torch::Tensor forward(torch::Tensor Q_d, torch::Tensor K_d, torch::Tensor V_d) {
   torch::Tensor O = torch::zeros({batch_size, seq_len, d}, torch::kCUDA);
   torch::Tensor O_l = torch::zeros({batch_size, seq_len}, torch::kCUDA);
 
-  run_flash(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
+  run_flash_parallel_coarse(O, O_l, K_d, Q_d, V_d, batch_size, seq_len);
   return O;
 }
