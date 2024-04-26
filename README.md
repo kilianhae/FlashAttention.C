@@ -23,3 +23,6 @@ or if you want to run it without pytorch wrapping run:
 nvcc test.cu -o test
 ./test
 ```
+
+## Experimental:
+Instead of caching the whole Q one can get some SMEM size savings by setting CACHE_Q to 0 in flashattention.cu and now must change uncomment line 150. This results in more SMEM stores but the gained occupancy by reducing the size of the SMEM has showed increase in performance in our tests.
