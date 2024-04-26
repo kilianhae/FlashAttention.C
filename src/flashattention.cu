@@ -77,6 +77,8 @@ void silly_attn_parallel(float *out, float* out_l, float *K, float *Q, float* V,
   }
   __syncthreads();
 
+  
+
   // T_c = seq_len (due to K^T) / B_c, chunk over the d dimension
   // T_c is the number of chunks of K, we iterate over them
   for (int j = 0; j < T_c; j++) {
@@ -187,6 +189,10 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
   const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
 
 
+  // do if: blockIdx.y * B_r + innerRowK * TM + row < seq_len
+  // or: j * B_c + innerColK * TN + col < seq_len
+
+  int id;
   // load Q_i, UNCOMMENT only if your Q is caching over full d
   if (CACHE_Q){
     const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
@@ -194,7 +200,15 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     const uint nr_loads = B_r * d / numThreadsBlocktile;
     for (int t=0; t<nr_loads; t++){
       // need to laod block of size B_r x d (64 x 64) with numThreadsBlocktile threads
-      Q_i[innerRowQ][innerColQ + t * numThreadsBlocktile] = Q[batch_offset + (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile];
+      // if (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile / d
+      id = (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile;
+      // 4 x 4 then this is 5 thus 5/
+      if (id < d*seq_len){
+        Q_i[innerRowQ][innerColQ + t * numThreadsBlocktile] = Q[batch_offset + id];
+      }
+      else {
+        Q_i[innerRowQ][innerColQ + t * numThreadsBlocktile] = 0.0;
+      }
     }
   }
   __syncthreads();
@@ -211,11 +225,16 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       // load K_j and V_j, thread idx, idy loads idy,idx
       // we load a tile
       for (int i=0; i<B_r; i+=strideK){
-        // load Q, K and V in tiles (for now we are loading the full V)
-        if (not CACHE_Q){Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + blockIdx.y * B_r) * d  + i * d + innerColK + t * B_c];
-        } // if you cache Q over whole d then remove this line
-        K_j[innerRowK+i][innerColK] = K[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c];
-        V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + (innerRowK + j * B_c) * d  + i * d + innerColK + t * B_c];
+        id = (innerRowK + j * B_c) * d + i * d + innerColK + t * B_c;
+        if (id < d*seq_len){
+          K_j[innerRowK+i][innerColK] = K[batch_offset + id];
+          V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + id];
+        }
+        else {
+          K_j[innerRowK+i][innerColK] = 0.0;
+          V_j[innerRowK+i][innerColK+t*B_c] = 0.0;
+        }
+       
       }
       __syncthreads();
       
@@ -238,12 +257,12 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
       }
       __syncthreads();
     }
+    
 
-    //finally store the results in S_i
+    // store the results in S_i
     for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
       for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-        S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] =
-          threadResults[resIdxM * TN + resIdxN];
+        S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = threadResults[resIdxM * TN + resIdxN];
       }
     }
     __syncthreads();
@@ -257,16 +276,25 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     // Compute additional A: \exp(Q_iK^T_{j+1} - m^{j+1}) \cdot V_j
 
     // each tread now needs to find max of the rows its assigned to (WARNING: implemented very naively)
+    int bound;
+    if (j<T_c-1){
+      bound = B_c;
+    }
+    else{
+      bound = (seq_len+31)%B_c + 1;
+    }
+
     for (int i=0;i<TM;++i){
       last_m[i] = m_i[i];
       float m = m_i[i];
-      for (int jj = 0; jj < B_c; jj += 1) {
+      for (int jj = 0; jj < bound; jj += 1) {
         if (m < S_i[threadRow*TM+i][jj]) {
           m = S_i[threadRow*TM+i][jj];
         }
       }
       m_i[i] = m;
     }
+
 
     // 2) renormalize current O
     if (j > 0) {
@@ -276,7 +304,8 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
           O_i[t*TN*TM + i*TN + jj] *= exp(last_m[i] - m_i[i]);
         }
       }
-    }}
+    }
+    }
 
     // 3) renormalize the sum l_i
     for (int i=0;i<TM;++i){
@@ -284,10 +313,15 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
     }
 
     // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TO OPTIMIZE!!
-    for (int dd = 0; dd < B_c; dd++) {
+    int idrow = threadIdx.y*B_r+threadRow*TM;
+    int idcol = j*B_c+threadCol*TN;
+
+    for (int dd = 0; dd < bound; dd++) {
       for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
-        regM[ii] = exp(S_i[threadRow*TN+ii][dd] - m_i[ii]);
-        l_i[ii] += regM[ii];
+        //check wether thus is in range  or not (if not we set it to 0)
+        //if (idrow+ii < seq_len && idcol+dd < seq_len){
+          regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
+          l_i[ii] += regM[ii];
       }
       for (int t = 0; t < num_tiles; t++){
         for (int ii=0;ii<TN;ii++){
@@ -297,15 +331,18 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
           }
         }
       }
-    }
     __syncthreads();
+    }
+
   }
 
   // normalize the whole thing by the output sum and write to out
   for (int t = 0; t < num_tiles; t++){
     for (int ii=0;ii<TM;ii++){
       for (int jj=0;jj<TN;jj++){
-                out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN + jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
+        if(blockIdx.y*B_r+threadRow*TM+ii < seq_len){
+          out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN + jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
+        }
       }
     } 
   }
@@ -314,6 +351,7 @@ void silly_attn_parallel_coarse(float *out, float* out_l, float *K, float *Q, fl
 void run_silly_attn_parallel(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
   dim3 blockDim(B_r, B_c);
   dim3 gridDim(batch_size,  (seq_len+B_r-1)/B_r);
+  
   silly_attn_parallel<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c);
   cudaDeviceSynchronize();
 }
@@ -321,7 +359,7 @@ void run_silly_attn_parallel(torch::Tensor O, torch::Tensor O_l, torch::Tensor K
 void run_silly_attn_parallel_coarse(torch::Tensor O, torch::Tensor O_l, torch::Tensor K_d, torch::Tensor Q_d, torch::Tensor V_d, int batch_size, int seq_len) {
   dim3 blockDim(B_r/TN, B_c/TM);
   dim3 gridDim(batch_size, (seq_len+B_r-1)/B_r);
-  silly_attn_parallel_coarse<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) seq_len/B_r, (int) seq_len/B_c, seq_len);
+  silly_attn_parallel_coarse<<<gridDim, blockDim>>>(O.data_ptr<float>(), O_l.data_ptr<float>(), K_d.data_ptr<float>(), Q_d.data_ptr<float>(), V_d.data_ptr<float>(), (float) 1.0, (int) seq_len * d, (int) (seq_len+B_r-1)/B_r, (int) (seq_len+B_c-1)/B_c, seq_len);
   cudaDeviceSynchronize();
 }
 

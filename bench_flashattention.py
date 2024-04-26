@@ -8,13 +8,14 @@ minimal_flash = load(name='flash', sources=['src/main.cpp', 'src/flashattention.
 
 batch_size = 1
 n_head = 16
-seq_len = 31
+seq_len = 8192
 head_embd = 32
 torch.cuda.empty_cache()
 
-q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
-k = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
+q = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
+k = torch.ones(batch_size * n_head, seq_len, head_embd).cuda()
 v = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
+       
 
 # Compare to Pytroch's matmul
 def manual_attention(q, k):
