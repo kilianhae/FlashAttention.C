@@ -757,7 +757,7 @@ void attention_forward(int kernel_num,
     switch (kernel_num) {
         case 1:
             printf("Running kernel 1\n");
-            attention_forward6(out, inp, B, T, C, NH, block_size);
+            attention_forward0(out, inp, B, T, C, NH, block_size);
             break;
         default:
             printf("Invalid kernel number\n");
