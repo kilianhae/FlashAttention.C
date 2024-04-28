@@ -1,5 +1,5 @@
 ## FlashAttention.C
-A minimal FLashattention implementation in pure Cuda C. It consistently performs as fast as pytorch or faster for settings where the sequence length is limiting.
+A minimal Flashattention implementation in pure Cuda C. It consistently performs as fast as Pytorch or faster for settings where the sequence length is limiting.
 
 Inspired by recent efforts like: [flashattention minimal](https://github.com/tspeterkim/flash-attention-minimal.git), the goal of this project is to provide a readable implementation in pure Cuda, whilst also being fast and scalable.
 
@@ -26,3 +26,8 @@ nvcc test.cu -o test
 
 ## Experimental:
 Instead of caching the whole Q one can get some SMEM size savings by setting CACHE_Q to 0 in flashattention.cu and now must change uncomment line 150. This results in more SMEM stores but the gained occupancy by reducing the size of the SMEM has showed increase in performance in our tests.
+
+## Todo:
+- Optimize the Softmax part to let threads collaborate on computing the row-wise max instead. Getting down from linea complexity to log2 complexity with minimal overhead should be easily possible. As the bacthes are small overhead needs to be very low to make it work.
+- Optimize for lower SMEM footprint (maybe don't cache full Value rows)
+- Optimize for using larger TN,TM > 4. For this probably need to optimize resister usage do lower because right now the kernel does not execute on 8x8 register tiles
