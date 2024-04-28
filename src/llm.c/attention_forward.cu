@@ -881,8 +881,8 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
     const int BK = B_c;
 
     const int batch_offset = d * seq_len * blockIdx.x;
-    const int TN = 1;
-    const int TM = 1;
+    const int TN = 4;
+    const int TM = 4;
     const int num_tiles = 32/32; // d/BK;
   /*
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
@@ -1005,7 +1005,7 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
     for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
       for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
         if (j*B_c + threadCol * TN + resIdxN <= blockIdx.y * B_r + threadRow * TM + resIdxM){
-          S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = threadResults[resIdxM * TN + resIdxN];
+          S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = threadResults[resIdxM * TN + resIdxN] *scaling;
         }
         else{
           S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = -INFINITY;
@@ -1013,28 +1013,11 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
         }
     }
     __syncthreads();
-    
-    // tested up to here with different seq length and hidden dim and seems to work fine
-    // find max of each row for current j: m^{j} = max(m_{j-1},\max_i S_i)
-    // renormalize current A: A^{j} \cdot \exp(m^{j} - m^{j+1})
-    // renormalize the sum: l^{j} \cdot \exp(m^{j} - m^{j+1})
-    // compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1})
-    // sum up new parts: sum \exp(Q_iK^T_{j+1} - m^{j+1})
-    // Compute additional A: \exp(Q_iK^T_{j+1} - m^{j+1}) \cdot V_j
-
-    // each tread now needs to find max of the rows its assigned to (WARNING: implemented very naively)
-    int bound;
-    if (j<T_c-1){
-      bound = B_c;
-    }
-    else{
-      bound = (seq_len+31)%B_c + 1;
-    }
 
     for (int i=0;i<TM;++i){
       last_m[i] = m_i[i];
       float m = m_i[i];
-      for (int jj = 0; jj < bound; jj += 1) {
+      for (int jj = 0; jj < B_c; jj += 1) {
         if (m < S_i[threadRow*TM+i][jj]) {
           m = S_i[threadRow*TM+i][jj];
         }
@@ -1060,10 +1043,7 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
     }
 
     // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TO OPTIMIZE!!
-    int idrow = threadIdx.y*B_r+threadRow*TM;
-    int idcol = j*B_c+threadCol*TN;
-
-    for (int dd = 0; dd < bound; dd++) {
+    for (int dd = 0; dd < B_c; dd++) {
       for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
         //check wether thus is in range  or not (if not we set it to 0)
         //if (idrow+ii < seq_len && idcol+dd < seq_len){
@@ -1112,8 +1092,8 @@ void attention_forward6(float* out,
     const int d = C / NH;
     // more
     
-    int TM = 1;
-    int TN = 1;
+    int TM = 4;
+    int TN = 4;
 
     const float softmax_scale = 1.0 / sqrt(d);
 
@@ -1218,7 +1198,9 @@ int main(int argc, char **argv) {
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* preatt = (float*)malloc(B * NH * T * T * sizeof(float));
     float* att = (float*)malloc(B * NH * T * T * sizeof(float));
+    
     float* inp = make_random_float(B * T * 3 * C);
+    //float* inp = make_1(B * T * 3 * C);
 
     // move to GPU
     float* d_out;
