@@ -6,21 +6,25 @@ from torch.utils.cpp_extension import load
 # Load the CUDA kernel as a python module
 minimal_flash = load(name='flash', sources=['src/main.cpp', 'src/flashattention.cu'], extra_cuda_cflags=['-O3'])
 
-batch_size = 2
-n_head = 8
-seq_len = 8192
-head_embd = 64
+batch_size = 1
+n_head = 1
+seq_len = 32
+head_embd = 32
 torch.cuda.empty_cache()
 
 q = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 k = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
 v = torch.randn(batch_size * n_head, seq_len, head_embd).cuda()
-       
+print(v)
 
 # Compare to Pytroch's matmul
 def manual_attention(q, k):
     S = torch.matmul(q, k.transpose(-2, -1))#/math.sqrt(head_embd)
+    
+    tril = torch.tril(S)
+    S=S.masked_fill(tril == 0, float("-inf"))
     A = F.softmax(S, dim=-1)
+    print(A)
     O = torch.matmul(A, v)
     return O
 
