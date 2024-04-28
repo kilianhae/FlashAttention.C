@@ -51,14 +51,6 @@ float* make_random_float(size_t N) {
     return arr;
 }
 
-float* make_1(size_t N) {
-    float* arr = (float*)malloc(N * sizeof(float));
-    for (size_t i = 0; i < N; i++) {
-        arr[i] = 1.0; // range -1..1
-    }
-    return arr;
-}
-
 int* make_random_int(size_t N, int V) {
     int* arr = (int*)malloc(N * sizeof(int));
     for (size_t i = 0; i < N; i++) {
@@ -88,23 +80,6 @@ template<class T>
 void validate_result(T* device_result, const T* cpu_reference, const char* name, std::size_t num_elements, T tolerance=1e-4) {
     T* out_gpu = (T*)malloc(num_elements * sizeof(T));
     cudaCheck(cudaMemcpy(out_gpu, device_result, num_elements * sizeof(T), cudaMemcpyDeviceToHost));
-    // print both matrices for debugging
-    printf("First 5 elements of %s:\n", name);
-    for (int i = 0; i < 32; i++) {
-        for (int j = 0; j < 32; j++) {
-            printf("%f ", out_gpu[i*32 + j]);
-        }
-        printf("\n");
-    }
-    printf("\n");
-    for (int i = 0; i < 32; i++) {
-        for (int j = 0; j < 32; j++) {
-            printf("%f ", cpu_reference[i*32 + j]);
-        }
-        printf("\n");
-    }
-
-
     int nfaults = 0;
     for (int i = 0; i < num_elements; i++) {
         // print the first few comparisons

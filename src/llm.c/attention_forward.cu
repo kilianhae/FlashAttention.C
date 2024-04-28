@@ -875,7 +875,7 @@ void attention_forward5(float* out, float* preatt, float* att,
 __global__ void flashattention(float *out, float *K, float *Q, float* V, float scaling, int T_r, int T_c, int seq_len)
 {   
     // define constants
-    const int d = 32;
+    const int d = 64;
     const int B_c = 32;
     const int B_r = 32;
     const int BK = B_c;
@@ -883,7 +883,7 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
     const int batch_offset = d * seq_len * blockIdx.x;
     const int TN = 4;
     const int TM = 4;
-    const int num_tiles = 32/32; // d/BK;
+    const int num_tiles = d/32; // d/BK;
   /*
   all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
   and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
@@ -1186,9 +1186,9 @@ int main(int argc, char **argv) {
     srand(0);
 
     int B = 1;
-    int T = 32;
-    int C = 32;
-    int NH = 1;
+    int T = 8192;
+    int C = 768;
+    int NH = 12;
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
