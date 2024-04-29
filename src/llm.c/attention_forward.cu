@@ -26,6 +26,7 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 */
 
 #include <stdio.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <float.h>
@@ -42,6 +43,12 @@ static cublasHandle_t cublas_handle;
 
 // ----------------------------------------------------------------------------
 // CPU code reference
+double getTimeStamp() {
+    struct timeval tv;
+    gettimeofday( &tv, NULL );
+    return (double) tv.tv_usec/1000000 + tv.tv_sec;
+}
+
 
 void attention_forward_cpu(float* out, float* preatt, float* att,
                        const float* inp,
@@ -871,78 +878,67 @@ void attention_forward5(float* out, float* preatt, float* att,
     attention_forward_fused1<<<dim3(x_blocks, NH, B), block_size>>>(out, preatt, att, inp, B, T, C, NH);
 }
 
-
 __global__ void flashattention(float *out, float *K, float *Q, float* V, float scaling, int T_r, int T_c, int seq_len)
-{   
-    // define constants
+{   // used by attention_forward6
+    // define constants, could be adjusted for different hardware specs
     const int d = 64;
     const int B_c = 32;
     const int B_r = 32;
     const int BK = B_c;
+    const int CACHE_Q = 0; // if 1 then cache Q in SMEM otherwise reload it over the tiles
 
     const int batch_offset = d * seq_len * blockIdx.x;
     const int TN = 4;
     const int TM = 4;
-    const int num_tiles = d/32; // d/BK;
-  /*
-  all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
-  and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
-  */
- // define static smem such that i can still adress it with indices
+    const int num_tiles = d/32; // or d/BK, number of tiles that the attention computation is split into
+    /*
+    NOTE: all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
+    and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
+    */
     int tid_x = threadIdx.x;
-  int tid_y = threadIdx.y;
+    int tid_y = threadIdx.y;
 
+    // statically define in SMEM and still address it with indices
+    //__shared__ float Q_i[B_r][d]; // uncomment only if you want to cache over full d (if CACHE_Q = 1)
+    __shared__ float Q_i[B_r][BK]; // if you want to save SMEM loads and keep the full Q loaded then change this to [B_r][d]
+    
+    __shared__ float K_j[B_c][BK+1]; // reduce SMEM bank conflicts by adding 1 column as K will be loaded transposed!
+    __shared__ float V_j[B_c][d];
+    
+    // attention result
+    __shared__ float S_i[B_r][B_c+1]; // reduce SMEM bank conflicts by adding 1 column (in the naive softmax part)
+    
+    const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block
+    const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // number of threads needed
+    const int threadId_flat = threadIdx.y * blockDim.x + threadIdx.x; // flattened thread id  (used for coalesced loading of tiles)
 
-  /*
-  all are fully loaded into shared memory SMEM, I think we should adjust this as second step to only loading it in tiles of B_r x 32 
-  and iterating the mults over the 32 sized tiles this way we can have a larger d, while keeping occupancy high
-  */
-  
-  __shared__ float Q_i[B_r][d]; // uncomment only if you want to cache over full d (if CACHE_Q = 1), also + 1 seems to help SMEM latency here too
-  //__shared__ float Q_i[B_r][BK]; // if you want to save SMEM loads and keep the full Q loaded then change this to [B_r][d]
-  __shared__ float K_j[B_c][BK+1]; // reduce SMEM bank conflicts by adding 1 column as K will be loaded transposed!
-  __shared__ float V_j[B_c][d];
-  
-  // attention result
-  __shared__ float S_i[B_r][B_c+1]; // reduce SMEM bank conflicts by adding 1 column (in the naive softmax part)
-  
-  const uint totalResultsBlocktile = B_r * B_c; // number of results to calculate per block
-  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN); // number of threads needed
-  const int threadId_flat = threadIdx.y * blockDim.x + threadIdx.x; // flattened thread id  (used for loading tiles coalesced)
+    // each thread process one block at position:
+    const int threadCol = threadId_flat % (B_c / TN);
+    const int threadRow = threadId_flat / (B_c / TN);
+        
+    float l_i[TM]= {0.0};; // storing the intermediate sum of exponentials per row
+    float m_i[TM]; // storing the intermediate max value of the rows
+    float last_m[TM]; // storing the last max value of the rows
+    float O_i[num_tiles * TN * TM] = {0.0}; // storing the intermediate results of the Outputs (each thread stores a chunk TM x TN per tile)
+    
+    // reset to min
+    for (int ii = 0; ii < TM; ii++) {
+        m_i[ii] = -INFINITY;
+    }
 
-  // each thread process 1 block at position:
-  const int threadCol = threadId_flat % (B_c / TN); // 0-63 % 8 => 0,1,2,3,4...7,0,1,2,3,4...7,... 0,1,2,3,4...7
-  const int threadRow = threadId_flat / (B_c / TN); // 0-63 / 8 => 0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1,..., 7,7,7,7,7,7,7,7
+    //WARNING: due to coalsecing I should probably add a second set of variables for using BK+1
+    const uint strideK = numThreadsBlocktile / BK; // 64 / 64 = 1
+    const uint innerRowK = threadId_flat / BK; // 0-63 / 64, 0000000000000...0
+    const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
 
-  //const int num_tiles = d/BK; // how many tiles are the computationof the attention is split into
-  
-  float l_i[TM]= {0.0};; // storing the intermediate sum of exp per row
-  float m_i[TM]; // storing the intermediate max of the rows
-  float last_m[TM]; // storing the last max of the rows
-  float O_i[num_tiles * TN * TM] = {0.0}; // storing the intermediate results of the Outputs (each thread stores a chunk TM x TN per tile)
-  
-  // rset to min
-  for (int ii = 0; ii < TM; ii++) {
-    m_i[ii] = -INFINITY;
-  }
-
-  //WARNING due to coalsecing I should probably add a second set of variables for using BK+1
-  const uint strideK = numThreadsBlocktile / BK; // 64 / 64 = 1
-  const uint innerRowK = threadId_flat / BK; // 0-63 / 64, 0000000000000...0
-  const uint innerColK = threadId_flat % BK; // 0-63 % 64, 0123456789101112...63
-
-
-  // do if: blockIdx.y * B_r + innerRowK * TM + row < seq_len
-  // or: j * B_c + innerColK * TN + col < seq_len
-
-  int id;
-  // load Q_i, UNCOMMENT only if your Q is caching over full d
-  
+    int id;
+    // load Q_i, UNCOMMENT only if your Q is caching over full d
     const uint innerRowQ = threadId_flat / d; // 0-63 / 64, 0000000000000...0
     const uint innerColQ = threadId_flat % d; // 0-63 % 64, 0123456789012...63
     const uint nr_loads = B_r * d / numThreadsBlocktile;
+
     for (int t=0; t<nr_loads; t++){
-      // need to laod block of size B_r x d (64 x 64) with numThreadsBlocktile threads
+      // need to load block of size B_r x d (64 x 64) with numThreadsBlocktile threads
       // if (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile / d
       id = (blockIdx.y * B_r + innerRowQ) * d + innerColQ + t * numThreadsBlocktile;
       // 4 x 4 then this is 5 thus 5/
@@ -954,134 +950,157 @@ __global__ void flashattention(float *out, float *K, float *Q, float* V, float s
       }
     }
 
-  __syncthreads();
+    __syncthreads();
 
-  // scratchboard register for registertiling (coarsening of the matrix mults)
-  float regM[TM] = {0.0};
-  float regN[TN] = {0.0};
+    // scratchpad register for register-tiling (coarsening of the matrix mults)
+    float regM[TM] = {0.0};
+    float regN[TN] = {0.0};
 
-  for (int j = 0; j < T_c; j++) { // iterate of ver the chunks of K and V
-    float threadResults[TM * TN] = {0.0}; // storing the intermediate outputs
-    S_i[tid_y][tid_x] = 0.f;
-    
-    for (int t=0; t<num_tiles; t++){
-      // load K_j and V_j, thread idx, idy loads idy,idx
-      // we load a tile
-      for (int i=0; i<B_r; i+=strideK){
-        // load Q, K and V in tiles (for now we are loading the full V)
-        // if (not CACHE_Q){Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + blockIdx.y * B_r) * d  + i * d + innerColK + t * B_c];
-        // } // if you cache Q over whole d then remove this line
-        id = (innerRowK + j * B_c) * d + i * d + innerColK + t * B_c;
-        if (id < d*seq_len){
-          K_j[innerRowK+i][innerColK] = K[batch_offset + id];
-          V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + id];
+    for (int j = 0; j < T_c && j <= blockIdx.y ; j++) { // iterate of ver the chunks of K and V
+        float threadResults[TM * TN] = {0.0}; // storing the intermediate outputs
+        S_i[tid_y][tid_x] = 0.f;
+        
+        for (int t=0; t<num_tiles; t++){
+            // load K_j and V_j, thread idx, idy loads idy,idx
+            // we load a tile
+            for (int i=0; i<B_r; i+=strideK){
+                // load Q, K and V in tiles (for now we are loading the full V)
+                if (not CACHE_Q){Q_i[innerRowK+i][innerColK] = Q[batch_offset + (innerRowK + blockIdx.y * B_r) * d  + i * d + innerColK + t * B_c];
+                } // if you cache Q over whole d then remove this line
+                id = (innerRowK + j * B_c) * d + i * d + innerColK + t * B_c;
+                if (id < d*seq_len){
+                    K_j[innerRowK+i][innerColK] = K[batch_offset + id];
+                    V_j[innerRowK+i][innerColK+t*B_c] = V[batch_offset + id];
+                } else {
+                    K_j[innerRowK+i][innerColK] = 0.0;
+                    V_j[innerRowK+i][innerColK+t*B_c] = 0.0;
+                }
+        
+            }
+            __syncthreads();
+        
+            for (int dd=0; dd<BK; dd++){ // load elements of Q_i and K_j^T into registers
+                for (uint i = 0; i < TM; ++i) {
+                    if (CACHE_Q){
+                        regM[i] = Q_i[(threadRow * TM + i)][dd+t*BK]; // uncomment if you cache Q over full d
+                    } else {
+                        regM[i] = Q_i[(threadRow * TM + i)][dd];
+                    }
+                }
+                for (uint i = 0; i < TN; ++i) {
+                    regN[i] = K_j[threadCol * TN + i][dd];
+                }
+                for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                        threadResults[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
+                    }
+                }
+            }
+            __syncthreads();
         }
-        else {
-          K_j[innerRowK+i][innerColK] = 0.0;
-          V_j[innerRowK+i][innerColK+t*B_c] = 0.0;
-        }
-       
-      }
-      __syncthreads();
-      
-      for (int dd=0; dd<BK; dd++){ // load elements of Q_i and K_j^T into registers
-        for (uint i = 0; i < TM; ++i) {
-            regM[i] = Q_i[(threadRow * TM + i)][dd+t*BK]; // uncomment if you cache Q over full d
-        }
-        for (uint i = 0; i < TN; ++i) {
-          regN[i] = K_j[threadCol * TN + i][dd];
-        }
+        
+
+        // store the results in S_i, account for causal masking
         for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-          for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-            threadResults[resIdxM * TN + resIdxN] += regM[resIdxM] * regN[resIdxN];
-          }
+            for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                if (j*B_c + threadCol * TN + resIdxN <= blockIdx.y * B_r + threadRow * TM + resIdxM){
+                    S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = threadResults[resIdxM * TN + resIdxN] *scaling;
+                } else {
+                    S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = -INFINITY;
+                }      
+            }
         }
-      }
-      __syncthreads();
+        __syncthreads();
+
+        for (int i=0;i<TM;++i){
+            last_m[i] = m_i[i];
+            float m = m_i[i];
+            for (int jj = 0; jj < B_c; jj += 1) {
+                if (m < S_i[threadRow*TM+i][jj]) {
+                    m = S_i[threadRow*TM+i][jj];
+                }
+            }
+            m_i[i] = m;
+        }
+
+        // 2) renormalize current O
+        if (j > 0) {
+            for (int t = 0; t < num_tiles; t++){
+                for (int i=0;i<TM;++i){
+                    for (int jj=0;jj<TN;++jj){
+                        O_i[t*TN*TM + i*TN + jj] *= exp(last_m[i] - m_i[i]);
+                    }
+                }
+            }
+        }
+
+        // 3) renormalize the sum l_i
+        for (int i=0;i<TM;++i){
+            l_i[i] *= exp(last_m[i] - m_i[i]);
+        }
+
+        // // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TODO: TO OPTIMIZE
+        // for (int dd = 0; dd < B_c; dd++) {
+        //     for (int ii = 0; ii < TN; ii++){ 
+        //         // calculate new sum and load exp(Attention) weights
+        //         //check whether thus is in range or not (if not we set it to 0)
+        //         //if (idrow+ii < seq_len && idcol+dd < seq_len){
+        //         regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
+        //         l_i[ii] += regM[ii];
+        //     }
+        //     for (int t = 0; t < num_tiles; t++){
+        //         for (int ii=0;ii<TN;ii++){
+        //             for (int jj=0;jj<TM;jj++){ // calculate output elements
+        //                 regN[jj] = V_j[dd][t * B_c + threadCol * TN + jj];
+        //                 O_i[t*TN*TM + ii*TM + jj] += regM[ii] * regN[jj];
+        //             }
+        //         }
+        //     }
+        // __syncthreads();
+        // }
+
+
+        for (int t = 0; t < num_tiles; t++){
+            for (int dd = 0; dd < B_c; dd++) {
+                for (int ii = 0; ii < TN; ii++){
+                    regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
+                    if (t==0){
+                        l_i[ii] += regM[ii];
+                    }
+                    regN[ii] = V_j[dd][t * B_c + threadCol * TN + ii];
+                }
+                for (int ii=0;ii<TN;ii++){
+                    for (int jj=0;jj<TM;jj++){ // calculate output elements
+                        regN[jj] = V_j[dd][t * B_c + threadCol * TN + jj];
+                        O_i[t*TN*TM + ii*TM + jj] += regM[ii] * regN[jj];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        
+
+
+
     }
-    
 
-    // store the results in S_i
-    for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-      for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-        if (j*B_c + threadCol * TN + resIdxN <= blockIdx.y * B_r + threadRow * TM + resIdxM){
-          S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = threadResults[resIdxM * TN + resIdxN] *scaling;
-        }
-        else{
-          S_i[(threadRow * TM + resIdxM)][threadCol * TN + resIdxN] = -INFINITY;
-        }      
-        }
-    }
-    __syncthreads();
-
-    for (int i=0;i<TM;++i){
-      last_m[i] = m_i[i];
-      float m = m_i[i];
-      for (int jj = 0; jj < B_c; jj += 1) {
-        if (m < S_i[threadRow*TM+i][jj]) {
-          m = S_i[threadRow*TM+i][jj];
-        }
-      }
-      m_i[i] = m;
-    }
-
-
-    // 2) renormalize current O
-    if (j > 0) {
+    // normalize by the output sum and write to out matrix
     for (int t = 0; t < num_tiles; t++){
-      for (int i=0;i<TM;++i){
-        for (int jj=0;jj<TN;++jj){
-          O_i[t*TN*TM + i*TN + jj] *= exp(last_m[i] - m_i[i]);
-        }
-      }
+        for (int ii=0;ii<TM;ii++){
+            for (int jj=0;jj<TN;jj++){
+                if(blockIdx.y*B_r+threadRow*TM+ii < seq_len){
+                    out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN + jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
+                }
+            }
+        } 
     }
-    }
-
-    // 3) renormalize the sum l_i
-    for (int i=0;i<TM;++i){
-      l_i[i] *= exp(last_m[i] - m_i[i]);
-    }
-
-    // 4) compute \exp(Q_iK^T_{j+1} - m^{j+1}) = \exp(S_i-m^{j+1}) // TO OPTIMIZE!!
-    for (int dd = 0; dd < B_c; dd++) {
-      for (int ii=0;ii<TN;ii++){ // calculate new sum and load exp(Attention) weights
-        //check wether thus is in range  or not (if not we set it to 0)
-        //if (idrow+ii < seq_len && idcol+dd < seq_len){
-          regM[ii] = exp(S_i[threadRow*TM+ii][dd] - m_i[ii]);
-          l_i[ii] += regM[ii];
-      }
-      for (int t = 0; t < num_tiles; t++){
-        for (int ii=0;ii<TN;ii++){
-          for (int jj=0;jj<TM;jj++){ // calculate output elements
-            regN[jj] = V_j[dd][t * B_c + threadCol * TN + jj];
-            O_i[t*TN*TM + ii*TM + jj] += regM[ii] * regN[jj];
-          }
-        }
-      }
-    __syncthreads();
-    }
-
-  }
-
-  // normalize the whole thing by the output sum and write to out
-  for (int t = 0; t < num_tiles; t++){
-    for (int ii=0;ii<TM;ii++){
-      for (int jj=0;jj<TN;jj++){
-        if(blockIdx.y*B_r+threadRow*TM+ii < seq_len){
-          out[batch_offset + (blockIdx.y * B_r + threadRow*TM + ii) * d + t * B_c + threadCol*TN + jj] = O_i[t*TN*TM+ii*TM+jj] / l_i[ii];
-        }
-      }
-    } 
-  }
 }
-
 
 void attention_forward6(float* out,
                        const float* inp,
                        int B, int T, int C, int NH,
                        const int block_size) {
-    // TODO there should be no mallocs inside any of these functions!
-
     // these are hardcoded to 32 for now
     const int B_r = 32;
     const int B_c = 32;
@@ -1115,7 +1134,6 @@ void attention_forward6(float* out,
         exit(1);
     }
 
-
     // okay so now, this kernel wants Q,K,V to all be of shape (B, nh, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, nh, d)
     // so we have to permute the tensor using a kernel with block_size
@@ -1133,8 +1151,13 @@ void attention_forward6(float* out,
     permute_kernel<<<num_blocks, block_size>>>(q, k, v, inp, B, N, nh, d);
 
     // now actually call the flash attention kernel
+    cudaDeviceSynchronize();
+    double start, end;
+    start = getTimeStamp();
     flashattention<<<gridDim, blockDim>>>(out, k, q, v, softmax_scale, (N+B_r-1)/B_r, (N+B_c-1)/B_c, N);
     cudaDeviceSynchronize();
+    end = getTimeStamp();
+    //printf("Time taken for attention kernel: %f\n", end-start);
 
     // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     num_blocks = ceil_div(B * T * C, block_size);
@@ -1185,8 +1208,8 @@ void attention_forward(int kernel_num,
 int main(int argc, char **argv) {
     srand(0);
 
-    int B = 1;
-    int T = 8192;
+    int B = 8;
+    int T = 1024;
     int C = 768;
     int NH = 12;
 
@@ -1198,9 +1221,7 @@ int main(int argc, char **argv) {
     float* out = (float*)malloc(B * T * C * sizeof(float));
     float* preatt = (float*)malloc(B * NH * T * T * sizeof(float));
     float* att = (float*)malloc(B * NH * T * T * sizeof(float));
-    
     float* inp = make_random_float(B * T * 3 * C);
-    //float* inp = make_1(B * T * 3 * C);
 
     // move to GPU
     float* d_out;
